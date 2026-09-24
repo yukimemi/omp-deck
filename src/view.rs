@@ -243,6 +243,17 @@ mod tests {
     }
 
     #[test]
+    fn card_shows_cwd_as_a_title_tooltip_not_a_visible_line() {
+        let html = render_page(&parse_hosts(FIXTURE).unwrap(), NOW);
+        assert!(
+            html.contains(
+                "<h2 title=\"C:\\Users\\yukimemi\\src\\github.com\\yukimemi\\omp-deck\">"
+            )
+        );
+        assert!(!html.contains("class=\"cwd\""));
+    }
+
+    #[test]
     fn empty_state_is_not_an_error() {
         let html = render_page(&[], NOW);
         assert!(html.contains("no live omp sessions"));
