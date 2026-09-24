@@ -1,4 +1,4 @@
-//! The only module that touches the `omp` CLI.
+//! The only module that touches the `omp` CLI and the processes it starts.
 //!
 //! The process is spawned directly with an argument vector (never through a
 //! shell), with a short timeout, and is killed if the future is dropped.
@@ -55,6 +55,10 @@ pub trait Omp: Send + Sync {
     /// Start `omp --cwd <cwd> [--model <model>]` detached and return without
     /// waiting for the session to end. Fails if it dies right away.
     async fn start(&self, cwd: &Path, model: Option<&str>) -> Result<(), OmpError>;
+    /// End a session by killing its process. `omp collab` has no remote
+    /// stop command, so this kills the OS process at the pid `list` last
+    /// reported for it. Already-gone is success, not an error.
+    async fn stop(&self, pid: u32) -> Result<(), OmpError>;
 }
 
 /// How long `start` watches the launcher for an immediate failure.
@@ -157,6 +161,12 @@ impl Omp for RealOmp {
             .await
             .map_err(|e| OmpError::Spawn(e.to_string()))?
     }
+
+    async fn stop(&self, pid: u32) -> Result<(), OmpError> {
+        tokio::task::spawn_blocking(move || kill_pid(pid))
+            .await
+            .map_err(|e| OmpError::Spawn(e.to_string()))?
+    }
 }
 
 /// Windows: `omp` is a TUI that exits (as if hung up) when it has no console
@@ -201,6 +211,52 @@ fn spawn_detached(exe: &Path, args: &[String]) -> Result<(), OmpError> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     watch(cmd)
+}
+
+/// Windows: `taskkill /T` also takes down `omp`'s own child processes (e.g.
+/// a running tool). Exit code 128 means the pid was already gone, which
+/// counts as success: the goal is "not running", not "we did the killing".
+#[cfg(windows)]
+fn kill_pid(pid: u32) -> Result<(), OmpError> {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = std::process::Command::new("taskkill");
+    cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    let output = cmd.output().map_err(|e| OmpError::Spawn(e.to_string()))?;
+    if output.status.success() || output.status.code() == Some(128) {
+        return Ok(());
+    }
+    Err(OmpError::Exit {
+        code: output.status.code(),
+        stderr: String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .chars()
+            .take(500)
+            .collect(),
+    })
+}
+
+/// Elsewhere: `SIGTERM` via the `kill` utility; "No such process" counts as
+/// success (see above).
+#[cfg(not(windows))]
+fn kill_pid(pid: u32) -> Result<(), OmpError> {
+    let output = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output()
+        .map_err(|e| OmpError::Spawn(e.to_string()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("No such process") {
+        return Ok(());
+    }
+    Err(OmpError::Exit {
+        code: output.status.code(),
+        stderr: stderr.trim().chars().take(500).collect(),
+    })
 }
 
 /// Spawn and report a failure that happens within `START_WATCH`.
@@ -271,5 +327,29 @@ mod tests {
     async fn missing_explicit_binary_is_not_found() {
         let omp = RealOmp::new(Some(PathBuf::from("definitely-not-a-real-omp-binary")));
         assert!(matches!(omp.list().await, Err(OmpError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn stop_kills_a_running_process_and_is_idempotent() {
+        let omp = RealOmp::default();
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/c", "ping -n 31 127.0.0.1 >NUL"])
+                .spawn()
+        } else {
+            std::process::Command::new("sleep").arg("30").spawn()
+        }
+        .unwrap();
+        let pid = child.id();
+        assert!(omp.stop(pid).await.is_ok());
+        for _ in 0..20 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(matches!(child.try_wait(), Ok(Some(_))), "still running");
+        // Stopping an already-gone pid is still Ok: idempotent.
+        assert!(omp.stop(pid).await.is_ok());
     }
 }

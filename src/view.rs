@@ -112,7 +112,8 @@ fn render_card(host: &Host, now_ms: i64) -> String {
          <header><h2>{name}</h2><span class=\"badge {class}\">{label}</span></header>\n\
          <p class=\"cwd\">{cwd}</p>\n\
          <p class=\"meta\">{meta}</p>\n\
-         <p class=\"links\">{view}{control}</p>\n\
+         <p class=\"links\">{view}{control}<button type=\"button\" class=\"stop\" \
+         data-id=\"{id}\">close</button></p>\n\
          </article>\n",
         class = status.class(),
         name = escape_html(host.display_name()),
