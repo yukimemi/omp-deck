@@ -3,27 +3,104 @@
 
 use crate::model::Host;
 use crate::omp::{Access, Omp, OmpError};
+use crate::repos;
 use crate::view;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{FromRef, Path, State},
     http::{HeaderName, HeaderValue, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde_json::json;
 use std::sync::Arc;
 
 type Shared = Arc<dyn Omp>;
 
-pub fn router(omp: Arc<dyn Omp>) -> Router {
+/// What "new session" may offer: the scanned checkouts and the configured
+/// model candidates. Nothing outside these is ever handed to `omp`.
+pub struct Launcher {
+    pub repos: repos::Cache,
+    pub models: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub omp: Shared,
+    pub launcher: Arc<Launcher>,
+}
+
+impl FromRef<AppState> for Shared {
+    fn from_ref(state: &AppState) -> Self {
+        state.omp.clone()
+    }
+}
+
+pub fn router(omp: Arc<dyn Omp>, launcher: Arc<Launcher>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/hosts", get(api_hosts))
+        .route("/api/repos", get(api_repos))
+        .route("/api/models", get(api_models))
+        .route("/api/sessions", post(api_start))
         .route("/go/{instance_id}/{kind}", get(go))
         .layer(middleware::map_response(harden))
-        .with_state(omp)
+        .with_state(AppState { omp, launcher })
+}
+
+const NO_ROOTS_HINT: &str = "No repository roots configured. Add [repos] roots = [\"...\"] to      the omp-deck config file (see the README).";
+
+impl FromRef<AppState> for Arc<Launcher> {
+    fn from_ref(state: &AppState) -> Self {
+        state.launcher.clone()
+    }
+}
+
+async fn api_repos(State(l): State<Arc<Launcher>>) -> Response {
+    let repos = l.repos.get().await;
+    let hint = (!l.repos.has_roots()).then_some(NO_ROOTS_HINT);
+    Json(json!({ "repos": *repos, "hint": hint })).into_response()
+}
+
+async fn api_models(State(l): State<Arc<Launcher>>) -> Response {
+    Json(json!({ "models": l.models })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartRequest {
+    path: String,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+async fn api_start(
+    State(omp): State<Shared>,
+    State(l): State<Arc<Launcher>>,
+    Json(req): Json<StartRequest>,
+) -> Response {
+    // Only ever start omp in a checkout the scan itself just listed, with a
+    // model the config names; the values passed on are ours, not the request's.
+    let repos = l.repos.get().await;
+    let Some(repo) = repos.iter().find(|r| r.path == req.path) else {
+        return plain(StatusCode::NOT_FOUND, "not a known checkout");
+    };
+    let model = match req.model.as_deref() {
+        None | Some("") => None,
+        Some(m) => match l.models.iter().find(|c| c.as_str() == m) {
+            Some(c) => Some(c.as_str()),
+            None => return plain(StatusCode::BAD_REQUEST, "not a configured model"),
+        },
+    };
+    match omp.start(std::path::Path::new(&repo.path), model).await {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({ "started": true }))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn harden(mut res: Response) -> Response {
@@ -112,6 +189,8 @@ mod tests {
     struct FakeOmp {
         hosts: Result<Vec<Host>, String>,
         links: Mutex<Vec<(String, Access)>>,
+        starts: Mutex<Vec<(std::path::PathBuf, Option<String>)>>,
+        start_error: Option<String>,
     }
 
     impl FakeOmp {
@@ -119,6 +198,8 @@ mod tests {
             Arc::new(Self {
                 hosts,
                 links: Mutex::new(Vec::new()),
+                starts: Mutex::new(Vec::new()),
+                start_error: None,
             })
         }
     }
@@ -138,13 +219,33 @@ mod tests {
                 .push((instance_id.to_string(), access));
             Ok(SECRET.to_string())
         }
+        async fn start(&self, cwd: &std::path::Path, model: Option<&str>) -> Result<(), OmpError> {
+            if let Some(stderr) = &self.start_error {
+                return Err(OmpError::Exit {
+                    code: Some(3),
+                    stderr: stderr.clone(),
+                });
+            }
+            self.starts
+                .lock()
+                .unwrap()
+                .push((cwd.to_path_buf(), model.map(String::from)));
+            Ok(())
+        }
+    }
+
+    fn launcher(roots: Vec<std::path::PathBuf>, models: &[&str]) -> Arc<Launcher> {
+        Arc::new(Launcher {
+            repos: repos::Cache::new(roots, std::time::Duration::from_secs(30)),
+            models: models.iter().map(|m| m.to_string()).collect(),
+        })
     }
 
     async fn get_path(
         omp: &Arc<FakeOmp>,
         path: &str,
     ) -> (StatusCode, axum::http::HeaderMap, String) {
-        let app = router(omp.clone());
+        let app = router(omp.clone(), launcher(Vec::new(), &[]));
         let res = app
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
             .await
@@ -260,5 +361,143 @@ mod tests {
         let (status, _, body) = get_path(&omp, "/api/hosts").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("\"hosts\":[]"));
+    }
+
+    /// A tempdir holding one ghq-layout checkout, plus the path the scan reports.
+    fn one_checkout() -> (tempfile::TempDir, Arc<Launcher>, String) {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(t.path().join("h/o/r/.git")).unwrap();
+        let l = launcher(vec![t.path().to_path_buf()], &["opus", "gpt-5.2"]);
+        let path = repos::scan(&[t.path().to_path_buf()])[0].path.clone();
+        (t, l, path)
+    }
+
+    async fn call(app: Router, req: Request<Body>) -> (StatusCode, String) {
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    async fn post_session(
+        omp: &Arc<FakeOmp>,
+        l: &Arc<Launcher>,
+        body: serde_json::Value,
+    ) -> (StatusCode, String) {
+        let req = Request::post("/api/sessions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        call(router(omp.clone(), l.clone()), req).await
+    }
+
+    #[tokio::test]
+    async fn start_runs_omp_in_a_scanned_checkout_with_a_candidate_model() {
+        let (_t, l, path) = one_checkout();
+        let omp = fixture();
+        let (status, body) = post_session(&omp, &l, json!({ "path": path, "model": "opus" })).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.contains("\"started\":true"));
+        assert_eq!(
+            *omp.starts.lock().unwrap(),
+            vec![(std::path::PathBuf::from(&path), Some("opus".to_string()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn start_without_or_with_empty_model_passes_no_model() {
+        let (_t, l, path) = one_checkout();
+        let omp = fixture();
+        for body in [
+            json!({ "path": path }),
+            json!({ "path": path, "model": "" }),
+            json!({ "path": path, "model": null }),
+        ] {
+            assert_eq!(post_session(&omp, &l, body).await.0, StatusCode::ACCEPTED);
+        }
+        let starts = omp.starts.lock().unwrap();
+        assert_eq!(starts.len(), 3);
+        assert!(starts.iter().all(|(_, m)| m.is_none()));
+    }
+
+    #[tokio::test]
+    async fn start_rejects_paths_the_scan_did_not_list() {
+        let (t, l, path) = one_checkout();
+        let omp = fixture();
+        let elsewhere = tempfile::tempdir().unwrap();
+        for bad in [
+            elsewhere.path().display().to_string(),
+            t.path().display().to_string(),
+            format!("{path}{}..", std::path::MAIN_SEPARATOR),
+            format!("{path} "),
+            "--help".to_string(),
+            String::new(),
+        ] {
+            let (status, _) = post_session(&omp, &l, json!({ "path": bad })).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{bad:?}");
+        }
+        assert!(omp.starts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_rejects_models_that_are_not_candidates() {
+        let (t, l, path) = one_checkout();
+        let omp = fixture();
+        for bad in ["OPUS", "opus ", "--yolo", "opus;calc", "gpt"] {
+            let (status, _) = post_session(&omp, &l, json!({ "path": path, "model": bad })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+        // No candidates configured: any non-empty model is refused too.
+        let bare = launcher(vec![t.path().to_path_buf()], &[]);
+        let (status, _) = post_session(&omp, &bare, json!({ "path": path, "model": "opus" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(omp.starts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_failure_is_502_with_the_error() {
+        let (_t, l, path) = one_checkout();
+        let omp = Arc::new(FakeOmp {
+            hosts: Ok(Vec::new()),
+            links: Mutex::new(Vec::new()),
+            starts: Mutex::new(Vec::new()),
+            start_error: Some("no console".into()),
+        });
+        let (status, body) = post_session(&omp, &l, json!({ "path": path })).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.contains("no console"));
+    }
+
+    #[tokio::test]
+    async fn start_rejects_unknown_fields_and_malformed_bodies() {
+        let (_t, l, path) = one_checkout();
+        let omp = fixture();
+        let (status, _) = post_session(&omp, &l, json!({ "path": path, "args": ["--x"] })).await;
+        assert!(status.is_client_error());
+        let (status, _) = post_session(&omp, &l, json!({ "model": "opus" })).await;
+        assert!(status.is_client_error());
+        assert!(omp.starts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn repos_and_models_endpoints() {
+        let (_t, l, path) = one_checkout();
+        let omp = fixture();
+        let get = |app: Router, p: &'static str| async move {
+            let (_, body) = call(app, Request::get(p).body(Body::empty()).unwrap()).await;
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()
+        };
+        let v = get(router(omp.clone(), l.clone()), "/api/repos").await;
+        assert_eq!(v["repos"][0]["name"], "o/r");
+        assert_eq!(v["repos"][0]["path"], path.as_str());
+        assert!(v["hint"].is_null());
+        let v = get(router(omp.clone(), l.clone()), "/api/models").await;
+        assert_eq!(v["models"], json!(["opus", "gpt-5.2"]));
+        // Unconfigured: empty picker with a hint, no models.
+        let bare = || router(omp.clone(), launcher(Vec::new(), &[]));
+        let v = get(bare(), "/api/repos").await;
+        assert_eq!(v["repos"], json!([]));
+        assert!(v["hint"].as_str().unwrap().contains("roots"));
+        assert_eq!(get(bare(), "/api/models").await["models"], json!([]));
     }
 }

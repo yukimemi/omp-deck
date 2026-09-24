@@ -4,9 +4,11 @@
 //! layers (`omp`, `server`) so it can be unit tested without a process or a socket.
 
 pub mod bind;
+pub mod config;
 pub mod model;
 pub mod notify;
 pub mod omp;
+pub mod repos;
 pub mod server;
 pub mod view;
 

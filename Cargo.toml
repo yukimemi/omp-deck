@@ -20,7 +20,11 @@ serde_json = "1.0.151"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "time"] }
 which = "8"
+teravars = { version = "0.2.2", features = ["merge"] }
+toml = "1"
+dirs = "6"
 
 [dev-dependencies]
 parking_lot = "0.12.5"
+tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }

@@ -7,7 +7,7 @@ use crate::model::{Host, parse_hosts};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -52,6 +52,22 @@ pub trait Omp: Send + Sync {
     async fn list(&self) -> Result<Vec<Host>, OmpError>;
     /// `omp collab link <instanceId> --json [--view]`; returns the secret URL.
     async fn link(&self, instance_id: &str, access: Access) -> Result<String, OmpError>;
+    /// Start `omp --cwd <cwd> [--model <model>]` detached and return without
+    /// waiting for the session to end. Fails if it dies right away.
+    async fn start(&self, cwd: &Path, model: Option<&str>) -> Result<(), OmpError>;
+}
+
+/// How long `start` watches the launcher for an immediate failure.
+const START_WATCH: Duration = Duration::from_secs(2);
+
+/// Characters that cannot be passed safely through `cmd.exe`'s command line.
+#[cfg(any(windows, test))]
+fn unsafe_for_cmd(arg: &str) -> bool {
+    arg.is_empty()
+        || arg.ends_with('\\')
+        || arg
+            .chars()
+            .any(|c| matches!(c, '"' | '%' | '!') || c.is_control())
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +145,96 @@ impl Omp for RealOmp {
         // Do not echo `out` on failure: it holds the secret.
         parse_link(&out).map_err(|_| OmpError::Parse("unexpected link output".into()))
     }
+
+    async fn start(&self, cwd: &Path, model: Option<&str>) -> Result<(), OmpError> {
+        let exe = self.resolve()?;
+        let mut args = vec!["--cwd".to_string(), cwd.display().to_string()];
+        if let Some(model) = model {
+            args.push("--model".into());
+            args.push(model.to_string());
+        }
+        tokio::task::spawn_blocking(move || spawn_detached(&exe, &args))
+            .await
+            .map_err(|e| OmpError::Spawn(e.to_string()))?
+    }
+}
+
+/// Windows: `omp` is a TUI that exits (as if hung up) when it has no console
+/// to read, and Rust's `Command` always hands the child explicit std handles,
+/// so `CREATE_NEW_CONSOLE` alone does not give it one. `cmd /c start` creates
+/// the process with a fresh console and no inherited handles, and the omp it
+/// starts outlives both `cmd` and this server. Every argument is wrapped in
+/// quotes by hand, and the few characters that cannot survive `cmd` are refused.
+#[cfg(windows)]
+fn spawn_detached(exe: &Path, args: &[String]) -> Result<(), OmpError> {
+    use std::os::windows::process::CommandExt;
+    let exe = exe.display().to_string();
+    if std::iter::once(&exe).chain(args).any(|a| unsafe_for_cmd(a)) {
+        return Err(OmpError::Spawn(
+            "path or model contains a character cmd.exe cannot pass safely".into(),
+        ));
+    }
+    let mut cmd = std::process::Command::new("cmd.exe");
+    cmd.args(["/c", "start"])
+        .raw_arg("\"\"")
+        .arg("/min")
+        .raw_arg(format!("\"{exe}\""));
+    for a in args {
+        cmd.raw_arg(format!("\"{a}\""));
+    }
+    cmd.creation_flags(0x0800_0000) // CREATE_NO_WINDOW: for cmd itself, not omp
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    watch(cmd)
+}
+
+/// Elsewhere: best effort, own process group, no terminal. Untested against a
+/// real omp; if it needs a tty there, it dies within `START_WATCH` and 502s.
+#[cfg(not(windows))]
+fn spawn_detached(exe: &Path, args: &[String]) -> Result<(), OmpError> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args)
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    watch(cmd)
+}
+
+/// Spawn and report a failure that happens within `START_WATCH`.
+fn watch(mut cmd: std::process::Command) -> Result<(), OmpError> {
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            OmpError::NotFound(e.to_string())
+        } else {
+            OmpError::Spawn(e.to_string())
+        }
+    })?;
+    let deadline = std::time::Instant::now() + START_WATCH;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                return Err(OmpError::Exit {
+                    code: status.code(),
+                    stderr: stderr.trim().chars().take(500).collect(),
+                });
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // Still running: `omp` itself (non-Windows) is up.
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(OmpError::Spawn(e.to_string())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -149,6 +255,16 @@ mod tests {
             stderr: "boom".into(),
         };
         assert_eq!(e.to_string(), "omp exited with 1: boom");
+    }
+
+    #[test]
+    fn cmd_unsafe_args_are_detected() {
+        for bad in ["", "a\"b", "50%", "hi!", "dir\\", "a\nb"] {
+            assert!(unsafe_for_cmd(bad), "{bad:?}");
+        }
+        for ok in [r"C:\src\my repo", "gpt-5.2", "a&b"] {
+            assert!(!unsafe_for_cmd(ok), "{ok:?}");
+        }
     }
 
     #[tokio::test]
