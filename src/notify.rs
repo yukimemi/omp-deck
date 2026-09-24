@@ -35,10 +35,31 @@ fn newly_titled<'a>(hosts: &'a [Host], notified: &HashSet<String>) -> Vec<&'a Ho
         .collect()
 }
 
-/// The Discord webhook payload for a newly titled session.
+/// Discord's hard cap on a message's `content` field.
+const DISCORD_CONTENT_LIMIT: usize = 2000;
+
+/// The Discord webhook payload for a newly titled session. Mentions in the
+/// session's title (`@everyone`, `@here`, role/user pings) are suppressed:
+/// the title comes from `omp`, effectively an untrusted string, and a ping
+/// storm is not an acceptable side effect of naming a session. `content` is
+/// truncated to Discord's 2000-character limit, past which the webhook POST
+/// would otherwise fail with 400.
 fn payload(host: &Host, url: &str) -> serde_json::Value {
+    let mut content = format!(
+        "omp collab session started: **{}**\n{}",
+        host.display_name(),
+        url
+    );
+    if content.len() > DISCORD_CONTENT_LIMIT {
+        let mut cut = DISCORD_CONTENT_LIMIT;
+        while !content.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        content.truncate(cut);
+    }
     serde_json::json!({
-        "content": format!("omp collab session started: **{}**\n{}", host.display_name(), url),
+        "content": content,
+        "allowed_mentions": { "parse": [] },
     })
 }
 
@@ -174,6 +195,22 @@ mod tests {
         let content = p["content"].as_str().unwrap();
         assert!(content.contains("https://my.omp.sh/#secret"));
         assert!(content.contains(hosts[1].display_name()));
+    }
+
+    #[test]
+    fn payload_suppresses_all_mentions() {
+        let hosts = parse_hosts(FIXTURE).unwrap();
+        let p = payload(&hosts[1], "https://my.omp.sh/#secret");
+        assert_eq!(p["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn payload_content_never_exceeds_the_discord_limit() {
+        let mut hosts = parse_hosts(FIXTURE).unwrap();
+        hosts[1].session_name = Some("x".repeat(DISCORD_CONTENT_LIMIT * 2));
+        let p = payload(&hosts[1], "https://my.omp.sh/#secret");
+        let content = p["content"].as_str().unwrap();
+        assert!(content.len() <= DISCORD_CONTENT_LIMIT);
     }
 
     #[tokio::test]
