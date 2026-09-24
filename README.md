@@ -32,6 +32,7 @@ omp config set collab.autoStart control
 ```sh
 omp-deck serve [--bind ADDR:PORT] [--discord-webhook URL]   # prints the URL on stdout
 omp-deck list [--json]                                      # terminal table / parsed model
+omp-deck self-update [--yes] [--check]                       # update the binary itself
 ```
 
 - Without `--bind`, the server listens on this machine's Tailscale IPv4
@@ -54,6 +55,10 @@ omp-deck list [--json]                                      # terminal table / p
   `502`. An empty list means "no live omp sessions", not an error.
 - Every request spawns `omp` fresh with a 5 second timeout. With `omp.cmd` on
   Windows a timeout may leave the child of the batch wrapper running.
+- Every command checks GitHub for a newer release in the background (throttled
+  to once every 24 hours) and prints a banner to stderr pointing at
+  `omp-deck self-update` if one exists — never a silent install. Set
+  `OMP_DECK_NO_AUTOUPDATE=1` to disable the check entirely.
 
 ## Security
 

@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+mod update;
+
 #[derive(Parser)]
 #[command(
     version,
@@ -36,11 +38,27 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Check for and install a newer omp-deck release
+    SelfUpdate {
+        /// Install without prompting
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Only check for an update; do not install
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Skip the background check for `self-update` itself: it already does
+    // its own explicit check, and the two would race the same GitHub call.
+    let auto_update = if matches!(cli.command, Command::SelfUpdate { .. }) {
+        None
+    } else {
+        update::maybe_spawn_auto_update_check()
+    };
     let omp = Arc::new(RealOmp::new(cli.omp));
     let result = match cli.command {
         Command::Serve {
@@ -48,7 +66,11 @@ async fn main() -> ExitCode {
             discord_webhook,
         } => serve(omp, bind, discord_webhook).await,
         Command::List { json } => list(&omp, json).await,
+        Command::SelfUpdate { yes, check } => update::run_self_update(yes, check).await,
     };
+    if let Some(handle) = auto_update {
+        update::finalize_auto_update_check(handle).await;
+    }
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
