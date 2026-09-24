@@ -5,6 +5,7 @@
 
 pub mod bind;
 pub mod model;
+pub mod notify;
 pub mod omp;
 pub mod server;
 pub mod view;
