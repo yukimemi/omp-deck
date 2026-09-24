@@ -1,7 +1,7 @@
 //! `examples/smoke.rs` — release-time smoke target.
 //!
 //! Runs the JSON parsing and HTML rendering paths of the produced build on a
-//! fixture. No network and no subprocess: omp-deck's only outbound action is
+//! fixture, and builds the HTTPS client (TLS provider resolution). No network and no subprocess: omp-deck's only outbound action is
 //! spawning `omp`, which a release runner does not have.
 
 use omp_deck::bind::choose_bind;
@@ -27,6 +27,14 @@ fn main() {
 
     let bind = choose_bind(None, None).expect("default bind");
     assert!(!bind.addr.ip().is_unspecified(), "never binds 0.0.0.0");
+
+    // The lock holds rustls with both aws-lc-rs (via kaishin's reqwest 0.13)
+    // and ring (via reqwest 0.12), so no process-level provider is picked
+    // automatically. Building the webhook client here would panic if the
+    // release binary could not resolve one. Building does no I/O.
+    reqwest::Client::builder()
+        .build()
+        .expect("https client builds with both crypto providers linked");
 
     println!("smoke: ok ({} cards)", hosts.len());
 }
