@@ -16,6 +16,10 @@ use std::time::Duration;
 /// dashboard page's own auto-reload interval (see `page.html`).
 pub const POLL_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Upper bound on one webhook POST, so an unresponsive endpoint cannot stall
+/// the poll loop forever.
+const POST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Hosts that just got a title and have not been notified about yet. Pure:
 /// no I/O, so it is unit-testable without a process or a socket.
 fn newly_titled<'a>(hosts: &'a [Host], notified: &HashSet<String>) -> Vec<&'a Host> {
@@ -84,7 +88,12 @@ async fn poll_once(
             Ok(()) => {
                 notified.insert(instance_id);
             }
-            Err(e) => eprintln!("omp-deck: discord notify failed for {instance_id}: {e}"),
+            // The error's Display embeds the webhook URL (which carries the
+            // token); strip it before logging.
+            Err(e) => eprintln!(
+                "omp-deck: discord notify failed for {instance_id}: {}",
+                e.without_url()
+            ),
         }
     }
 }
@@ -112,7 +121,10 @@ async fn baseline(omp: &dyn Omp, notified: &mut HashSet<String>) -> bool {
 /// Runs until the process exits: takes a baseline of already-titled sessions,
 /// then sleeps `POLL_INTERVAL` and runs [`poll_once`], forever.
 pub async fn run(omp: Arc<dyn Omp>, webhook: String) {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(POST_TIMEOUT)
+        .build()
+        .expect("failed to build discord http client");
     let mut notified: HashSet<String> = HashSet::new();
     while !baseline(omp.as_ref(), &mut notified).await {
         tokio::time::sleep(POLL_INTERVAL).await;
