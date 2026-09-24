@@ -38,16 +38,26 @@ fn payload(host: &Host, url: &str) -> serde_json::Value {
     })
 }
 
-async fn post(client: &reqwest::Client, webhook: &str, body: &serde_json::Value) {
-    if let Err(e) = client.post(webhook).json(body).send().await {
-        eprintln!("omp-deck: discord notify failed: {e}");
-    }
+/// POSTs to the webhook; a non-2xx response (429, 5xx, 404 ...) is an error.
+async fn post(
+    client: &reqwest::Client,
+    webhook: &str,
+    body: &serde_json::Value,
+) -> Result<(), reqwest::Error> {
+    client
+        .post(webhook)
+        .json(body)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
 /// One list-and-notify pass: lists live sessions, and for each newly titled
 /// one not already in `notified`, fetches its control link and posts it.
 /// Failures (a failed `list`/`link` call, a failed webhook POST) are logged;
-/// they never abort the pass or poison `notified`.
+/// they never abort the pass, and a session is only added to `notified` after
+/// its POST succeeded, so a failed one is retried on the next pass.
 async fn poll_once(
     omp: &dyn Omp,
     client: &reqwest::Client,
@@ -70,16 +80,43 @@ async fn poll_once(
                 continue;
             }
         };
-        post(client, webhook, &payload(host, &url)).await;
-        notified.insert(instance_id);
+        match post(client, webhook, &payload(host, &url)).await {
+            Ok(()) => {
+                notified.insert(instance_id);
+            }
+            Err(e) => eprintln!("omp-deck: discord notify failed for {instance_id}: {e}"),
+        }
     }
 }
 
-/// Runs until the process exits: sleeps `POLL_INTERVAL`, then [`poll_once`],
-/// forever.
+/// Records every session that is already titled as notified, without posting,
+/// so a restart does not re-announce sessions that were running before it.
+/// Returns false if the list call failed (nothing recorded).
+async fn baseline(omp: &dyn Omp, notified: &mut HashSet<String>) -> bool {
+    match omp.list().await {
+        Ok(hosts) => {
+            let ids: Vec<String> = newly_titled(&hosts, notified)
+                .into_iter()
+                .map(|h| h.instance_id.clone())
+                .collect();
+            notified.extend(ids);
+            true
+        }
+        Err(e) => {
+            eprintln!("omp-deck: discord notify: could not list sessions: {e}");
+            false
+        }
+    }
+}
+
+/// Runs until the process exits: takes a baseline of already-titled sessions,
+/// then sleeps `POLL_INTERVAL` and runs [`poll_once`], forever.
 pub async fn run(omp: Arc<dyn Omp>, webhook: String) {
     let client = reqwest::Client::new();
     let mut notified: HashSet<String> = HashSet::new();
+    while !baseline(omp.as_ref(), &mut notified).await {
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
         poll_once(omp.as_ref(), &client, &webhook, &mut notified).await;
@@ -125,6 +162,43 @@ mod tests {
         let content = p["content"].as_str().unwrap();
         assert!(content.contains("https://my.omp.sh/#secret"));
         assert!(content.contains(hosts[1].display_name()));
+    }
+
+    #[tokio::test]
+    async fn baseline_marks_titled_hosts_without_posting() {
+        let omp = FakeOmp {
+            hosts: parse_hosts(FIXTURE).unwrap(),
+            link_url: String::new(),
+        };
+        let mut notified = HashSet::new();
+        assert!(baseline(&omp, &mut notified).await);
+        assert_eq!(notified, HashSet::from(["inst-bbb".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn failed_post_is_not_marked_notified_and_is_retried() {
+        let app = axum::Router::new().route(
+            "/webhook",
+            axum::routing::post(|| async { axum::http::StatusCode::TOO_MANY_REQUESTS }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let omp = FakeOmp {
+            hosts: parse_hosts(FIXTURE).unwrap(),
+            link_url: "https://my.omp.sh/#secret".to_string(),
+        };
+        let mut notified = HashSet::new();
+        poll_once(
+            &omp,
+            &reqwest::Client::new(),
+            &format!("http://{addr}/webhook"),
+            &mut notified,
+        )
+        .await;
+        assert!(notified.is_empty());
     }
 
     struct FakeOmp {
