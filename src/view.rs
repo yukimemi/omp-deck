@@ -109,8 +109,7 @@ fn render_card(host: &Host, now_ms: i64) -> String {
     };
     format!(
         "<article class=\"card {class}\">\n\
-         <header><h2>{name}</h2><span class=\"badge {class}\">{label}</span></header>\n\
-         <p class=\"cwd\">{cwd}</p>\n\
+         <header><h2 title=\"{cwd}\">{name}</h2><span class=\"badge {class}\">{label}</span></header>\n\
          <p class=\"meta\">{meta}</p>\n\
          <p class=\"links\">{view}{control}</p>\n\
          </article>\n",
