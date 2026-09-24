@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use omp_deck::bind::{choose_bind, tailscale_ip_output};
 use omp_deck::omp::{Omp, RealOmp};
-use omp_deck::{now_ms, server, view};
+use omp_deck::{notify, now_ms, server, view};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -26,6 +26,9 @@ enum Command {
         /// Address to listen on, ADDR:PORT (default: this machine's Tailscale IPv4, any free port)
         #[arg(long)]
         bind: Option<String>,
+        /// Discord webhook URL; posts a message once a session gets a title
+        #[arg(long, env = "OMP_DECK_DISCORD_WEBHOOK")]
+        discord_webhook: Option<String>,
     },
     /// Print the live sessions on the terminal
     List {
@@ -38,9 +41,12 @@ enum Command {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let omp = RealOmp::new(cli.omp);
+    let omp = Arc::new(RealOmp::new(cli.omp));
     let result = match cli.command {
-        Command::Serve { bind } => serve(omp, bind).await,
+        Command::Serve {
+            bind,
+            discord_webhook,
+        } => serve(omp, bind, discord_webhook).await,
         Command::List { json } => list(&omp, json).await,
     };
     match result {
@@ -63,7 +69,11 @@ async fn list(omp: &RealOmp, json: bool) -> Result<(), String> {
     Ok(())
 }
 
-async fn serve(omp: RealOmp, bind: Option<String>) -> Result<(), String> {
+async fn serve(
+    omp: Arc<RealOmp>,
+    bind: Option<String>,
+    discord_webhook: Option<String>,
+) -> Result<(), String> {
     let tailscale = if bind.is_none() {
         tailscale_ip_output().await
     } else {
@@ -78,7 +88,10 @@ async fn serve(omp: RealOmp, bind: Option<String>) -> Result<(), String> {
         .map_err(|e| format!("cannot bind {}: {e}", chosen.addr))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?;
     println!("http://{local}/");
-    axum::serve(listener, server::router(Arc::new(omp)))
+    if let Some(webhook) = discord_webhook {
+        tokio::spawn(notify::run(omp.clone(), webhook));
+    }
+    axum::serve(listener, server::router(omp))
         .await
         .map_err(|e| e.to_string())
 }

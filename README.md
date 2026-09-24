@@ -30,8 +30,8 @@ omp config set collab.autoStart control
 ## Usage
 
 ```sh
-omp-deck serve [--bind ADDR:PORT]   # prints the URL on stdout
-omp-deck list [--json]              # terminal table / parsed model
+omp-deck serve [--bind ADDR:PORT] [--discord-webhook URL]   # prints the URL on stdout
+omp-deck list [--json]                                      # terminal table / parsed model
 ```
 
 - Without `--bind`, the server listens on this machine's Tailscale IPv4
@@ -39,6 +39,14 @@ omp-deck list [--json]              # terminal table / parsed model
   queried it falls back to `127.0.0.1` and says so on stderr. It never defaults
   to `0.0.0.0`.
 - `GET /` is the dashboard, `GET /api/hosts` the host list as JSON (no links).
+- With `--discord-webhook <URL>` (or `OMP_DECK_DISCORD_WEBHOOK`), `serve` polls
+  `omp collab list` every 15 seconds and posts a Discord message with the
+  **control** link the first time a session gets a title (`sessionName`), once
+  per session. Sessions already titled when `serve` starts are treated as
+  seen and not announced, so "once" holds across restarts. Untitled sessions
+  and repeat polls are skipped. A failed poll or webhook call (including a
+  non-2xx response) is logged to stderr, does not stop the server, and the
+  session is retried on the next poll.
 - Links are fetched per click via `GET /go/<instanceId>/<view|control>`, which
   runs `omp collab link` and answers `302` to the URL, so the secret never
   appears in the page, the JSON, or a cache.
@@ -52,7 +60,9 @@ omp-deck list [--json]              # terminal table / parsed model
 There is **no authentication**: the tailnet is the security boundary. Control
 links carry write access to the session, and anyone on the tailnet who can
 reach the dashboard can use them. Bind to a tailnet address you trust, or to
-`127.0.0.1`; do not expose the port beyond it.
+`127.0.0.1`; do not expose the port beyond it. The Discord webhook receives
+**control** links too: anyone with access to that Discord channel gets write
+access to the session.
 
 ## License
 
