@@ -10,7 +10,7 @@ keywords = ["omp", "dashboard", "collab"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-anyhow = "1"
+anyhow = "1.0.104"
 async-trait = "0.1.92"
 kaishin = "0.7.5"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
