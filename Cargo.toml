@@ -21,7 +21,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio = { version = "1.53.1", features = ["macros", "net", "process", "rt-multi-thread", "time"] }
 which = "8"
 teravars = { version = "0.2.2", features = ["merge"] }
-toml = "1"
+toml = "1.1.6"
 dirs = "6"
 
 [dev-dependencies]
