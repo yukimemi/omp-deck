@@ -1,0 +1,84 @@
+use clap::{Parser, Subcommand};
+use omp_deck::bind::{choose_bind, tailscale_ip_output};
+use omp_deck::omp::{Omp, RealOmp};
+use omp_deck::{now_ms, server, view};
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::Arc;
+
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Dashboard for the live omp collab sessions on this machine"
+)]
+struct Cli {
+    /// Path to the omp executable (default: look it up on PATH)
+    #[arg(long, global = true, env = "OMP_DECK_OMP")]
+    omp: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Serve the dashboard over HTTP (no authentication: the tailnet is the boundary)
+    Serve {
+        /// Address to listen on, ADDR:PORT (default: this machine's Tailscale IPv4, any free port)
+        #[arg(long)]
+        bind: Option<String>,
+    },
+    /// Print the live sessions on the terminal
+    List {
+        /// Print the parsed model as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let omp = RealOmp::new(cli.omp);
+    let result = match cli.command {
+        Command::Serve { bind } => serve(omp, bind).await,
+        Command::List { json } => list(&omp, json).await,
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("omp-deck: {msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn list(omp: &RealOmp, json: bool) -> Result<(), String> {
+    let hosts = omp.list().await.map_err(|e| e.to_string())?;
+    if json {
+        let out = serde_json::to_string_pretty(&hosts).map_err(|e| e.to_string())?;
+        println!("{out}");
+    } else {
+        print!("{}", view::render_table(&hosts, now_ms()));
+    }
+    Ok(())
+}
+
+async fn serve(omp: RealOmp, bind: Option<String>) -> Result<(), String> {
+    let tailscale = if bind.is_none() {
+        tailscale_ip_output().await
+    } else {
+        None
+    };
+    let chosen = choose_bind(bind.as_deref(), tailscale.as_deref())?;
+    if let Some(warning) = &chosen.warning {
+        eprintln!("omp-deck: {warning}");
+    }
+    let listener = tokio::net::TcpListener::bind(chosen.addr)
+        .await
+        .map_err(|e| format!("cannot bind {}: {e}", chosen.addr))?;
+    let local = listener.local_addr().map_err(|e| e.to_string())?;
+    println!("http://{local}/");
+    axum::serve(listener, server::router(Arc::new(omp)))
+        .await
+        .map_err(|e| e.to_string())
+}

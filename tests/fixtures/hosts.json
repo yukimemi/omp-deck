@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "futureField": {"ignored": true},
+  "hosts": [
+    {
+      "instanceId": "inst-aaa",
+      "generation": 3,
+      "pid": 4242,
+      "sessionId": "sess-1",
+      "sessionName": null,
+      "cwd": "C:\\Users\\yukimemi\\src\\github.com\\yukimemi\\omp-deck",
+      "model": {"provider": "anthropic", "id": "claude-x", "extra": 1},
+      "startedAt": 1700000000000,
+      "participants": 2,
+      "relayConnected": true,
+      "inputRequired": true,
+      "busy": false,
+      "access": "control",
+      "someNewThing": [1, 2, 3]
+    },
+    {
+      "instanceId": "inst-bbb",
+      "generation": 1,
+      "pid": 99,
+      "sessionId": "sess-2",
+      "sessionName": "<script>alert(1)</script>",
+      "cwd": "C:\\work\\<b>evil",
+      "model": {"provider": "openai", "id": "gpt-y"},
+      "startedAt": 1700000100000,
+      "participants": 1,
+      "relayConnected": false,
+      "inputRequired": false,
+      "busy": true,
+      "access": "view"
+    }
+  ]
+}

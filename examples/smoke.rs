@@ -1,33 +1,32 @@
 //! `examples/smoke.rs` — release-time smoke target.
 //!
-//! `release.yml` runs `cargo run --release --target <T> --example smoke`
-//! on every build matrix entry. The intent is to catch regressions
-//! that `cargo test` misses — class signature: the lib tests pass on
-//! every runner, but the produced binary panics on real-world startup
-//! (e.g., rustls `CryptoProvider` not pre-installed before the first
-//! HTTPS handshake — shoka v0.10.0 shipped that exact bug).
-//!
-//! The default body is intentionally no-op so kata can drop this file
-//! into every consumer crate without breaking releases that haven't
-//! yet decided what to exercise. **Override this file** in each crate
-//! to call the real startup path that's most likely to regress:
-//!
-//! - HTTPS-using CLIs: build the actual API client (octocrab,
-//!   reqwest, etc.) and issue a tiny no-auth GET (e.g.,
-//!   `https://api.github.com/zen`) — that forces the rustls handshake
-//!   to run inside the same binary the release publishes.
-//! - File-handling CLIs: write+read a temp file via the real I/O
-//!   helpers (catches missing crate features, permission regressions).
-//! - Library-only crates: just exit 0; `cargo test` is sufficient.
-//!
-//! Cost: an extra ~5-second job step per platform per release.
-//! Payoff: when this fails, the release blocks before publishing to
-//! GitHub Releases / crates.io, instead of users finding the bug.
+//! Runs the JSON parsing and HTML rendering paths of the produced build on a
+//! fixture. No network and no subprocess: omp-deck's only outbound action is
+//! spawning `omp`, which a release runner does not have.
+
+use omp_deck::bind::choose_bind;
+use omp_deck::model::parse_hosts;
+use omp_deck::view::{render_page, render_table};
+
+const HOSTS: &str = include_str!("../tests/fixtures/hosts.json");
+const EMPTY: &str = include_str!("../tests/fixtures/empty.json");
 
 fn main() {
-    eprintln!(
-        "smoke: no-op default — override examples/smoke.rs in this crate \
-         to exercise the startup path most likely to regress (HTTPS \
-         handshake, file I/O, etc.). See the file's module doc for ideas."
-    );
+    let hosts = parse_hosts(HOSTS).expect("fixture parses");
+    assert_eq!(hosts.len(), 2, "fixture host count");
+    assert_eq!(hosts[0].display_name(), "omp-deck", "cwd leaf fallback");
+
+    let html = render_page(&hosts, 1_700_000_300_000);
+    assert_eq!(html.matches("<article").count(), 2, "one card per host");
+    assert!(!html.contains("<script>alert(1)"), "sessionName is escaped");
+    assert!(html.contains("&lt;script&gt;"), "escaped form is present");
+
+    let empty = parse_hosts(EMPTY).expect("empty fixture parses");
+    assert!(render_page(&empty, 0).contains("no live omp sessions"));
+    assert!(render_table(&hosts, 1_700_000_300_000).contains("omp-deck"));
+
+    let bind = choose_bind(None, None).expect("default bind");
+    assert!(!bind.addr.ip().is_unspecified(), "never binds 0.0.0.0");
+
+    println!("smoke: ok ({} cards)", hosts.len());
 }
