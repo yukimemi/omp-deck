@@ -1,3 +1,5 @@
+<img src="assets/logo.svg" alt="omp-deck logo" width="64" height="64" align="right">
+
 # omp-deck
 
 A small CLI that serves a web dashboard of the live
