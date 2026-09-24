@@ -268,6 +268,13 @@ mod tests {
             assert_eq!(access, Access::Control);
             Ok(self.link_url.clone())
         }
+        async fn start(
+            &self,
+            _cwd: &std::path::Path,
+            _model: Option<&str>,
+        ) -> Result<(), crate::omp::OmpError> {
+            unreachable!("notify never starts sessions")
+        }
     }
 
     /// End-to-end: a real HTTP POST lands on a real local server, with the

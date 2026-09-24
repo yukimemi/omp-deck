@@ -1,12 +1,17 @@
 use clap::{Parser, Subcommand};
 use omp_deck::bind::{choose_bind, tailscale_ip_output};
+use omp_deck::config::Config;
 use omp_deck::omp::{Omp, RealOmp};
+use omp_deck::repos;
+use omp_deck::server::Launcher;
 use omp_deck::{notify, now_ms, server, view};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 mod update;
+
+const REPO_SCAN_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(
@@ -17,6 +22,9 @@ struct Cli {
     /// Path to the omp executable (default: look it up on PATH)
     #[arg(long, global = true, env = "OMP_DECK_OMP")]
     omp: Option<PathBuf>,
+    /// Config file with [repos] roots and [models] list (default: <config dir>/omp-deck/config.toml)
+    #[arg(long, global = true, env = "OMP_DECK_CONFIG")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -64,7 +72,7 @@ async fn main() -> ExitCode {
         Command::Serve {
             bind,
             discord_webhook,
-        } => serve(omp, bind, discord_webhook).await,
+        } => serve(omp, bind, discord_webhook, cli.config).await,
         Command::List { json } => list(&omp, json).await,
         Command::SelfUpdate { yes, check } => update::run_self_update(yes, check).await,
     };
@@ -95,7 +103,13 @@ async fn serve(
     omp: Arc<RealOmp>,
     bind: Option<String>,
     discord_webhook: Option<String>,
+    config: Option<PathBuf>,
 ) -> Result<(), String> {
+    let config = Config::load_or_default(config.as_deref()).map_err(|e| format!("{e:#}"))?;
+    let launcher = Arc::new(Launcher {
+        repos: repos::Cache::new(config.repos.roots, REPO_SCAN_TTL),
+        models: config.models.list,
+    });
     let tailscale = if bind.is_none() {
         tailscale_ip_output().await
     } else {
@@ -113,7 +127,7 @@ async fn serve(
     if let Some(webhook) = discord_webhook {
         tokio::spawn(notify::run(omp.clone(), webhook));
     }
-    axum::serve(listener, server::router(omp))
+    axum::serve(listener, server::router(omp, launcher))
         .await
         .map_err(|e| e.to_string())
 }

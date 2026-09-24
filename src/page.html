@@ -31,14 +31,72 @@ h1 { font-size: 1.2rem; margin: 0 0 1rem; }
 .note { padding: 1rem; border: 1px dashed var(--line); border-radius: .6rem; color: var(--muted); }
 .error { padding: 1rem; border: 2px solid #c92a2a; border-radius: .6rem; }
 .error pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: .5rem 0 0; }
+details#new-session { margin: 0 0 1rem; background: var(--card); border: 1px solid var(--line); border-radius: .6rem; padding: .6rem .8rem; }
+details#new-session summary { cursor: pointer; font-weight: 600; }
+#new-session form { display: grid; gap: .6rem; margin-top: .7rem; }
+#new-session label { display: grid; gap: .2rem; font-size: .85rem; color: var(--muted); }
+#new-session select, #new-session button { font: inherit; padding: .5rem; border-radius: .4rem; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+#new-session button { background: var(--fg); color: var(--bg); font-weight: 600; cursor: pointer; }
+#new-session button:disabled { opacity: .5; cursor: default; }
+#ns-status { margin: 0; font-size: .85rem; color: var(--muted); overflow-wrap: anywhere; }
+#ns-status.err { color: #c92a2a; }
 code { font-family: ui-monospace, monospace; }
 </style>
 </head>
 <body>
 <h1>omp deck</h1>
+<details id="new-session">
+<summary>New session</summary>
+<form id="ns-form">
+<label>Repository <select id="ns-repo" required></select></label>
+<label id="ns-model-label" hidden>Model <select id="ns-model"><option value="">(omp default)</option></select></label>
+<button type="submit" id="ns-go" disabled>Start omp</button>
+<p id="ns-status" role="status"></p>
+</form>
+</details>
 <!--BODY-->
 <script>
-setInterval(function () { if (!document.hidden) location.reload(); }, 15000);
+(function () {
+  var box = document.getElementById("new-session");
+  var repo = document.getElementById("ns-repo");
+  var model = document.getElementById("ns-model");
+  var modelLabel = document.getElementById("ns-model-label");
+  var go = document.getElementById("ns-go");
+  var status = document.getElementById("ns-status");
+  var loaded = false;
+  function say(text, err) { status.textContent = text; status.className = err ? "err" : ""; }
+  function opt(value, text) { var o = document.createElement("option"); o.value = value; o.textContent = text; return o; }
+  box.addEventListener("toggle", function () {
+    if (!box.open || loaded) return;
+    loaded = true;
+    Promise.all([
+      fetch("/api/repos").then(function (r) { return r.json(); }),
+      fetch("/api/models").then(function (r) { return r.json(); })
+    ]).then(function (both) {
+      var repos = both[0].repos || [], models = both[1].models || [];
+      repos.forEach(function (r) { repo.appendChild(opt(r.path, r.name + "  (" + r.path + ")")); });
+      models.forEach(function (m) { model.appendChild(opt(m, m)); });
+      modelLabel.hidden = models.length === 0;
+      go.disabled = repos.length === 0;
+      if (repos.length === 0) say(both[0].hint || "No repositories found under the configured roots.", false);
+    }).catch(function (e) { loaded = false; say("could not load choices: " + e, true); });
+  });
+  document.getElementById("ns-form").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    go.disabled = true;
+    say("starting...", false);
+    fetch("/api/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: repo.value, model: model.value || null })
+    }).then(function (r) {
+      if (r.status === 202) { say("started; it should appear below shortly", false); box.open = false; setTimeout(function () { location.reload(); }, 3000); return; }
+      return r.text().then(function (t) { say("failed (" + r.status + "): " + t, true); });
+    }).catch(function (e) { say("failed: " + e, true); }).then(function () { go.disabled = repo.options.length === 0; });
+  });
+  // The auto-refresh would wipe a half-filled form, so it pauses while open.
+  setInterval(function () { if (!document.hidden && !box.open) location.reload(); }, 15000);
+})();
 </script>
 </body>
 </html>
