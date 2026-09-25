@@ -1,6 +1,6 @@
 [package]
 name = "omp-deck"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 description = "Web dashboard listing the live omp collab sessions on this machine"
 license = "MIT"
