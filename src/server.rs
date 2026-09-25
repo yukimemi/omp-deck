@@ -11,7 +11,7 @@ use axum::{
     http::{HeaderName, HeaderValue, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -44,6 +44,7 @@ pub fn router(omp: Arc<dyn Omp>, launcher: Arc<Launcher>) -> Router {
         .route("/api/repos", get(api_repos))
         .route("/api/models", get(api_models))
         .route("/api/sessions", post(api_start))
+        .route("/api/sessions/{instance_id}", delete(api_stop))
         .route("/go/{instance_id}/{kind}", get(go))
         .layer(middleware::map_response(harden))
         .with_state(AppState { omp, launcher })
@@ -95,6 +96,32 @@ async fn api_start(
     };
     match omp.start(std::path::Path::new(&repo.path), model).await {
         Ok(()) => (StatusCode::ACCEPTED, Json(json!({ "started": true }))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_stop(State(omp): State<Shared>, Path(instance_id): Path<String>) -> Response {
+    // Only ever kill a pid omp itself just reported for this instance id,
+    // never one taken from the request.
+    let hosts: Vec<Host> = match omp.list().await {
+        Ok(h) => h,
+        Err(e) => return plain(StatusCode::BAD_GATEWAY, &e.to_string()),
+    };
+    let Some(host) = hosts.iter().find(|h| h.instance_id == instance_id) else {
+        return plain(StatusCode::NOT_FOUND, "no such live omp session");
+    };
+    let Some(pid) = host.pid else {
+        return plain(
+            StatusCode::BAD_GATEWAY,
+            "omp did not report a pid for this session",
+        );
+    };
+    match omp.stop(pid).await {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({ "stopped": true }))).into_response(),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
             Json(json!({ "error": e.to_string() })),
@@ -180,7 +207,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
     use tower::ServiceExt;
 
     const FIXTURE: &str = include_str!("../tests/fixtures/hosts.json");
@@ -191,6 +218,8 @@ mod tests {
         links: Mutex<Vec<(String, Access)>>,
         starts: Mutex<Vec<(std::path::PathBuf, Option<String>)>>,
         start_error: Option<String>,
+        stops: Mutex<Vec<u32>>,
+        stop_error: Option<String>,
     }
 
     impl FakeOmp {
@@ -200,6 +229,8 @@ mod tests {
                 links: Mutex::new(Vec::new()),
                 starts: Mutex::new(Vec::new()),
                 start_error: None,
+                stops: Mutex::new(Vec::new()),
+                stop_error: None,
             })
         }
     }
@@ -213,10 +244,7 @@ mod tests {
             })
         }
         async fn link(&self, instance_id: &str, access: Access) -> Result<String, OmpError> {
-            self.links
-                .lock()
-                .unwrap()
-                .push((instance_id.to_string(), access));
+            self.links.lock().push((instance_id.to_string(), access));
             Ok(SECRET.to_string())
         }
         async fn start(&self, cwd: &std::path::Path, model: Option<&str>) -> Result<(), OmpError> {
@@ -228,8 +256,17 @@ mod tests {
             }
             self.starts
                 .lock()
-                .unwrap()
                 .push((cwd.to_path_buf(), model.map(String::from)));
+            Ok(())
+        }
+        async fn stop(&self, pid: u32) -> Result<(), OmpError> {
+            if let Some(stderr) = &self.stop_error {
+                return Err(OmpError::Exit {
+                    code: Some(4),
+                    stderr: stderr.clone(),
+                });
+            }
+            self.stops.lock().push(pid);
             Ok(())
         }
     }
@@ -272,7 +309,7 @@ mod tests {
             assert!(!body.contains(SECRET), "{path}");
             assert!(!body.contains("my.omp.sh"), "{path}");
         }
-        assert!(omp.links.lock().unwrap().is_empty());
+        assert!(omp.links.lock().is_empty());
     }
 
     #[tokio::test]
@@ -316,7 +353,7 @@ mod tests {
         let (status, _, _) = get_path(&omp, "/go/inst-aaa/control").await;
         assert_eq!(status, StatusCode::FOUND);
         assert_eq!(
-            *omp.links.lock().unwrap(),
+            *omp.links.lock(),
             vec![
                 ("inst-bbb".to_string(), Access::View),
                 ("inst-aaa".to_string(), Access::Control)
@@ -335,7 +372,55 @@ mod tests {
             let (status, _, _) = get_path(&omp, path).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
         }
-        assert!(omp.links.lock().unwrap().is_empty());
+        assert!(omp.links.lock().is_empty());
+    }
+
+    async fn delete_path(omp: &Arc<FakeOmp>, path: &str) -> (StatusCode, String) {
+        let req = Request::delete(path).body(Body::empty()).unwrap();
+        call(router(omp.clone(), launcher(Vec::new(), &[])), req).await
+    }
+
+    #[tokio::test]
+    async fn stop_kills_the_pid_of_a_listed_instance() {
+        let omp = fixture();
+        let (status, body) = delete_path(&omp, "/api/sessions/inst-aaa").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.contains("\"stopped\":true"));
+        assert_eq!(*omp.stops.lock(), vec![4242]);
+    }
+
+    #[tokio::test]
+    async fn stop_rejects_unknown_instances_without_calling_stop() {
+        let omp = fixture();
+        let (status, _) = delete_path(&omp, "/api/sessions/unknown").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(omp.stops.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_502s_when_the_host_has_no_pid() {
+        let mut hosts = parse_hosts(FIXTURE).unwrap();
+        hosts[0].pid = None;
+        let omp = FakeOmp::new(Ok(hosts));
+        let (status, body) = delete_path(&omp, "/api/sessions/inst-aaa").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.contains("pid"));
+        assert!(omp.stops.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_failure_is_502_with_the_error() {
+        let omp = Arc::new(FakeOmp {
+            hosts: Ok(parse_hosts(FIXTURE).unwrap()),
+            links: Mutex::new(Vec::new()),
+            starts: Mutex::new(Vec::new()),
+            start_error: None,
+            stops: Mutex::new(Vec::new()),
+            stop_error: Some("access denied".into()),
+        });
+        let (status, body) = delete_path(&omp, "/api/sessions/inst-aaa").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.contains("access denied"));
     }
 
     #[tokio::test]
@@ -399,7 +484,7 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
         assert!(body.contains("\"started\":true"));
         assert_eq!(
-            *omp.starts.lock().unwrap(),
+            *omp.starts.lock(),
             vec![(std::path::PathBuf::from(&path), Some("opus".to_string()))]
         );
     }
@@ -415,7 +500,7 @@ mod tests {
         ] {
             assert_eq!(post_session(&omp, &l, body).await.0, StatusCode::ACCEPTED);
         }
-        let starts = omp.starts.lock().unwrap();
+        let starts = omp.starts.lock();
         assert_eq!(starts.len(), 3);
         assert!(starts.iter().all(|(_, m)| m.is_none()));
     }
@@ -436,7 +521,7 @@ mod tests {
             let (status, _) = post_session(&omp, &l, json!({ "path": bad })).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{bad:?}");
         }
-        assert!(omp.starts.lock().unwrap().is_empty());
+        assert!(omp.starts.lock().is_empty());
     }
 
     #[tokio::test]
@@ -451,7 +536,7 @@ mod tests {
         let bare = launcher(vec![t.path().to_path_buf()], &[]);
         let (status, _) = post_session(&omp, &bare, json!({ "path": path, "model": "opus" })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(omp.starts.lock().unwrap().is_empty());
+        assert!(omp.starts.lock().is_empty());
     }
 
     #[tokio::test]
@@ -462,6 +547,8 @@ mod tests {
             links: Mutex::new(Vec::new()),
             starts: Mutex::new(Vec::new()),
             start_error: Some("no console".into()),
+            stops: Mutex::new(Vec::new()),
+            stop_error: None,
         });
         let (status, body) = post_session(&omp, &l, json!({ "path": path })).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
@@ -476,7 +563,7 @@ mod tests {
         assert!(status.is_client_error());
         let (status, _) = post_session(&omp, &l, json!({ "model": "opus" })).await;
         assert!(status.is_client_error());
-        assert!(omp.starts.lock().unwrap().is_empty());
+        assert!(omp.starts.lock().is_empty());
     }
 
     #[tokio::test]

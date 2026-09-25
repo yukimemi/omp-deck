@@ -100,6 +100,16 @@ API: `GET /api/repos` (`{repos: [{name, path}], hint}`), `GET /api/models`,
 It answers `202` right away; an unknown path is `404`, a model that is not a
 configured candidate is `400`, and a failed launch is `502` with the error.
 
+Every card also has a **close** button. It calls
+`DELETE /api/sessions/<instanceId>`, which looks the id up in the same
+`omp collab list` output `/` uses and kills the pid it reports for that
+session (`taskkill /PID <pid> /T /F` on Windows, `kill -TERM <pid>`
+elsewhere) — omp has no remote "stop" command, so this ends the process
+directly, for any live session, not only ones started from this dashboard.
+It answers `202` right away; an unknown instance id is `404`, and a session
+omp did not report a pid for, or a failed kill, is `502` with the error.
+The button asks for confirmation first: there is no undo.
+
 ### How omp is launched
 
 `omp` is an interactive TUI. Tried by hand on Windows: with `CREATE_NO_WINDOW`,
