@@ -95,7 +95,14 @@ code { font-family: ui-monospace, monospace; }
     }).catch(function (e) { say("failed: " + e, true); }).then(function () { go.disabled = repo.options.length === 0; });
   });
   // The auto-refresh would wipe a half-filled form, so it pauses while open.
-  setInterval(function () { if (!document.hidden && !box.open) location.reload(); }, 15000);
+  function maybeReload() { if (!document.hidden && !box.open) location.reload(); }
+  setInterval(maybeReload, 15000);
+  // Background/mobile tabs throttle or fully suspend the interval above, so a
+  // session named while the tab was hidden (e.g. the phone screen locked)
+  // would otherwise stay showing its pre-hide render until the next tick, or
+  // forever if the interval itself was suspended. Reloading right when the
+  // tab regains visibility picks that up immediately.
+  document.addEventListener("visibilitychange", maybeReload);
 })();
 </script>
 </body>
