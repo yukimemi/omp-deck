@@ -109,8 +109,7 @@ fn render_card(host: &Host, now_ms: i64) -> String {
     };
     format!(
         "<article class=\"card {class}\">\n\
-         <header><h2>{name}</h2><span class=\"badge {class}\">{label}</span></header>\n\
-         <p class=\"cwd\">{cwd}</p>\n\
+         <header><h2 title=\"{cwd}\">{name}</h2><span class=\"badge {class}\">{label}</span></header>\n\
          <p class=\"meta\">{meta}</p>\n\
          <p class=\"links\">{view}{control}</p>\n\
          </article>\n",
@@ -241,6 +240,17 @@ mod tests {
         assert!(html.contains("started 5m ago"));
         assert!(html.contains("anthropic/claude-x"));
         assert!(!html.contains("my.omp.sh"));
+    }
+
+    #[test]
+    fn card_shows_cwd_as_a_title_tooltip_not_a_visible_line() {
+        let html = render_page(&parse_hosts(FIXTURE).unwrap(), NOW);
+        assert!(
+            html.contains(
+                "<h2 title=\"C:\\Users\\yukimemi\\src\\github.com\\yukimemi\\omp-deck\">"
+            )
+        );
+        assert!(!html.contains("class=\"cwd\""));
     }
 
     #[test]

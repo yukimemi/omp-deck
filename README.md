@@ -6,9 +6,9 @@ A small CLI that serves a web dashboard of the live
 [`omp`](https://github.com/can1357/oh-my-pi) collab sessions on this machine,
 so you can open any of them from your phone.
 
-One card per session: name, working directory, model, a busy / input-required /
-idle badge, participants and how long ago it started, with **view** and
-**control** links that open the `my.omp.sh` room.
+One card per session: name (hover/long-press for the full working directory),
+model, a busy / input-required / idle badge, participants and how long ago it
+started, with **view** and **control** links that open the `my.omp.sh` room.
 
 ## Install
 
