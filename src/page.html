@@ -14,29 +14,30 @@
 * { box-sizing: border-box; }
 body { margin: 0; padding: 1rem; background: var(--bg); color: var(--fg); font: 16px/1.4 system-ui, sans-serif; }
 h1 { font-size: 1.2rem; margin: 0 0 1rem; }
-.grid { display: grid; gap: .75rem; grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr)); }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: .6rem; padding: .8rem; }
+.grid { display: grid; gap: .75rem; grid-template-columns: repeat(auto-fill, minmax(min(18rem, 100%), 1fr)); }
+.card { min-width: 0; background: var(--card); border: 1px solid var(--line); border-radius: .6rem; padding: .8rem; }
 .card.input { border-color: #d9480f; box-shadow: 0 0 0 2px #d9480f; }
 .card header { display: flex; justify-content: space-between; align-items: baseline; gap: .5rem; }
-.card h2 { font-size: 1.05rem; margin: 0; overflow-wrap: anywhere; }
+.card h2 { font-size: 1.05rem; margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .badge { flex: none; font-size: .75rem; font-weight: 700; padding: .1rem .5rem; border-radius: 1rem; text-transform: uppercase; }
 .badge.input { background: #d9480f; color: #fff; }
 .badge.busy { background: #1971c2; color: #fff; }
 .badge.idle { background: var(--line); color: var(--muted); }
 .meta { margin: .3rem 0 0; color: var(--muted); font-size: .85rem; overflow-wrap: anywhere; }
 .links { display: flex; gap: .5rem; margin: .7rem 0 0; }
-.links a { flex: 1; text-align: center; padding: .5rem; border: 1px solid var(--line); border-radius: .4rem; color: inherit; text-decoration: none; font-weight: 600; }
+.links a { flex: 1; min-width: 0; overflow-wrap: anywhere; text-align: center; padding: .5rem; border: 1px solid var(--line); border-radius: .4rem; color: inherit; text-decoration: none; font-weight: 600; }
 .links a.control { background: var(--fg); color: var(--bg); }
-.links button.stop { flex: 1; text-align: center; padding: .5rem; border: 1px solid #c92a2a; border-radius: .4rem; background: var(--card); color: #c92a2a; font: inherit; font-weight: 600; cursor: pointer; }
+.links button.stop { flex: 1; min-width: 0; text-align: center; padding: .5rem; border: 1px solid #c92a2a; border-radius: .4rem; background: var(--card); color: #c92a2a; font: inherit; font-weight: 600; cursor: pointer; }
 .links button.stop:disabled { opacity: .5; cursor: default; }
 .note { padding: 1rem; border: 1px dashed var(--line); border-radius: .6rem; color: var(--muted); }
 .error { padding: 1rem; border: 2px solid #c92a2a; border-radius: .6rem; }
 .error pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: .5rem 0 0; }
-details#new-session { margin: 0 0 1rem; background: var(--card); border: 1px solid var(--line); border-radius: .6rem; padding: .6rem .8rem; }
+details#new-session { min-width: 0; margin: 0 0 1rem; background: var(--card); border: 1px solid var(--line); border-radius: .6rem; padding: .6rem .8rem; }
 details#new-session summary { cursor: pointer; font-weight: 600; }
-#new-session form { display: grid; gap: .6rem; margin-top: .7rem; }
-#new-session label { display: grid; gap: .2rem; font-size: .85rem; color: var(--muted); }
-#new-session select, #new-session input, #new-session button { font: inherit; padding: .5rem; border-radius: .4rem; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+#new-session form { display: grid; grid-template-columns: minmax(0, 1fr); gap: .6rem; margin-top: .7rem; }
+#new-session label { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; gap: .2rem; font-size: .85rem; color: var(--muted); }
+#new-session select, #new-session input, #new-session button { box-sizing: border-box; width: 100%; max-width: 100%; min-width: 0; font: inherit; padding: .5rem; border-radius: .4rem; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+#new-session select { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #new-session button { background: var(--fg); color: var(--bg); font-weight: 600; cursor: pointer; }
 #new-session button:disabled { opacity: .5; cursor: default; }
 #ns-status { margin: 0; font-size: .85rem; color: var(--muted); overflow-wrap: anywhere; }
