@@ -36,7 +36,7 @@ details#new-session { margin: 0 0 1rem; background: var(--card); border: 1px sol
 details#new-session summary { cursor: pointer; font-weight: 600; }
 #new-session form { display: grid; gap: .6rem; margin-top: .7rem; }
 #new-session label { display: grid; gap: .2rem; font-size: .85rem; color: var(--muted); }
-#new-session select, #new-session button { font: inherit; padding: .5rem; border-radius: .4rem; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+#new-session select, #new-session input, #new-session button { font: inherit; padding: .5rem; border-radius: .4rem; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
 #new-session button { background: var(--fg); color: var(--bg); font-weight: 600; cursor: pointer; }
 #new-session button:disabled { opacity: .5; cursor: default; }
 #ns-status { margin: 0; font-size: .85rem; color: var(--muted); overflow-wrap: anywhere; }
@@ -49,7 +49,7 @@ code { font-family: ui-monospace, monospace; }
 <details id="new-session">
 <summary>New session</summary>
 <form id="ns-form">
-<label>Repository <select id="ns-repo" required></select></label>
+<label>Repository <input type="search" id="ns-filter" placeholder="Filter by owner/name" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search" aria-label="Filter repositories"><select id="ns-repo" required></select></label>
 <label id="ns-model-label" hidden>Model <select id="ns-model"><option value="">(omp default)</option></select></label>
 <button type="submit" id="ns-go" disabled>Start omp</button>
 <p id="ns-status" role="status"></p>
@@ -60,6 +60,7 @@ code { font-family: ui-monospace, monospace; }
 (function () {
   var box = document.getElementById("new-session");
   var repo = document.getElementById("ns-repo");
+  var filter = document.getElementById("ns-filter");
   var model = document.getElementById("ns-model");
   var modelLabel = document.getElementById("ns-model-label");
   var go = document.getElementById("ns-go");
@@ -67,6 +68,34 @@ code { font-family: ui-monospace, monospace; }
   var loaded = false;
   function say(text, err) { status.textContent = text; status.className = err ? "err" : ""; }
   function opt(value, text) { var o = document.createElement("option"); o.value = value; o.textContent = text; return o; }
+  var allRepos = [];
+  // Case-insensitive substring match on the full name (owner/name) and the short name.
+  function matches(r, q) {
+    q = q.trim().toLowerCase();
+    if (!q) return true;
+    var full = r.name.toLowerCase();
+    return full.indexOf(q) !== -1 || full.split("/").pop().indexOf(q) !== -1;
+  }
+  // Rebuild the options rather than hiding them (hidden <option> is ignored on iOS Safari).
+  // The selection survives if still matching, else it moves to the first match.
+  function renderRepos() {
+    var q = filter.value, prev = repo.value;
+    var shown = allRepos.filter(function (r) { return matches(r, q); });
+    repo.textContent = "";
+    if (shown.length === 0) {
+      if (allRepos.length === 0) { go.disabled = true; return; }
+      var none = opt("", "No repositories match \u201c" + q.trim() + "\u201d");
+      none.disabled = true; none.selected = true;
+      repo.appendChild(none);
+    } else {
+      shown.forEach(function (r) { repo.appendChild(opt(r.path, r.name + "  (" + r.path + ")")); });
+      if (prev && shown.some(function (r) { return r.path === prev; })) repo.value = prev;
+    }
+    go.disabled = !repo.value;
+  }
+  filter.addEventListener("input", renderRepos);
+  // Enter in the filter box would submit the form and start omp on whatever is selected.
+  filter.addEventListener("keydown", function (ev) { if (ev.key === "Enter") ev.preventDefault(); });
   box.addEventListener("toggle", function () {
     if (!box.open || loaded) return;
     loaded = true;
@@ -75,10 +104,10 @@ code { font-family: ui-monospace, monospace; }
       fetch("/api/models").then(function (r) { return r.json(); })
     ]).then(function (both) {
       var repos = both[0].repos || [], models = both[1].models || [];
-      repos.forEach(function (r) { repo.appendChild(opt(r.path, r.name + "  (" + r.path + ")")); });
+      allRepos = repos;
+      renderRepos();
       models.forEach(function (m) { model.appendChild(opt(m, m)); });
       modelLabel.hidden = models.length === 0;
-      go.disabled = repos.length === 0;
       if (repos.length === 0) say(both[0].hint || "No repositories found under the configured roots.", false);
     }).catch(function (e) { loaded = false; say("could not load choices: " + e, true); });
   });
@@ -93,7 +122,7 @@ code { font-family: ui-monospace, monospace; }
     }).then(function (r) {
       if (r.status === 202) { say("started; it should appear below shortly", false); box.open = false; setTimeout(function () { location.reload(); }, 3000); return; }
       return r.text().then(function (t) { say("failed (" + r.status + "): " + t, true); });
-    }).catch(function (e) { say("failed: " + e, true); }).then(function () { go.disabled = repo.options.length === 0; });
+    }).catch(function (e) { say("failed: " + e, true); }).then(function () { go.disabled = !repo.value; });
   });
   // The auto-refresh would wipe a half-filled form, so it pauses while open.
   function maybeReload() { if (!document.hidden && !box.open) location.reload(); }

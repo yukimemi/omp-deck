@@ -254,6 +254,19 @@ mod tests {
         assert!(!html.contains("class=\"cwd\""));
     }
 
+    // The match logic runs in the browser and there is no JS test runner, so
+    // this only pins that the filter markup and its guards are shipped.
+    #[test]
+    fn page_has_repo_filter_without_autofocus_and_with_enter_guard() {
+        let html = render_page(&[], NOW);
+        assert!(html.contains("id=\"ns-filter\""));
+        assert!(html.contains("type=\"search\""));
+        assert!(!html.contains("autofocus"));
+        assert!(html.contains("ev.key === \"Enter\""));
+        assert!(html.contains("function matches("));
+        assert!(html.contains("No repositories match"));
+    }
+
     #[test]
     fn empty_state_is_not_an_error() {
         let html = render_page(&[], NOW);
