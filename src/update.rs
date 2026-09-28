@@ -234,6 +234,14 @@ pub fn successor_args(
 /// let an operator walk away from. Putting the child in its own process
 /// group (Unix) / its own process group detached from any console
 /// (Windows) keeps it alive after the terminal that started `serve` closes.
+///
+/// Only stdin is redirected (to nothing, since nobody is left to type into
+/// it); stdout/stderr are left inherited from this process, so the
+/// successor's own startup banner and update-check banner still land
+/// wherever this process's were going -- a systemd unit's journal, a
+/// container's log driver, a `nohup ... >log 2>&1` redirect. Nulling those
+/// too would silently swallow every log line the next `serve`, and every
+/// one after it, ever writes.
 pub fn spawn_successor(
     exe: &std::path::Path,
     bind: std::net::SocketAddr,
@@ -244,8 +252,6 @@ pub fn spawn_successor(
     let mut cmd = std::process::Command::new(exe);
     cmd.args(successor_args(bind, omp, config));
     cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
     if let Some(webhook) = discord_webhook {
         cmd.env("OMP_DECK_DISCORD_WEBHOOK", webhook);
     }
