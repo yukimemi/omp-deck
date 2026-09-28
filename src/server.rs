@@ -4,6 +4,7 @@
 use crate::model::Host;
 use crate::omp::{Access, Omp, OmpError};
 use crate::repos;
+use crate::sessions;
 use crate::view;
 use axum::{
     Json, Router,
@@ -14,15 +15,22 @@ use axum::{
     routing::{delete, get, post},
 };
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 type Shared = Arc<dyn Omp>;
 
-/// What "new session" may offer: the scanned checkouts and the configured
-/// model candidates. Nothing outside these is ever handed to `omp`.
+/// What "new session" may offer: the scanned checkouts, the configured model
+/// candidates, and where to look for a checkout's past sessions. Nothing
+/// outside these is ever handed to `omp`.
 pub struct Launcher {
     pub repos: repos::Cache,
     pub models: Vec<String>,
+    /// Root of `omp`'s own session log (`<dir>/sessions`), `None` if it could
+    /// not be resolved -- then no repo ever has past sessions to offer.
+    pub sessions_root: Option<PathBuf>,
+    /// `$HOME`, used to decode the directory name `omp` derives from a cwd.
+    pub home: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -46,6 +54,11 @@ pub fn router(omp: Arc<dyn Omp>, launcher: Arc<Launcher>) -> Router {
         .route("/api/sessions", post(api_start))
         .route("/api/sessions/{instance_id}", delete(api_stop))
         .route("/api/sessions/{instance_id}/resume", post(api_resume))
+        .route("/api/repos/{path}/sessions", get(api_repo_sessions))
+        .route(
+            "/api/repos/{path}/sessions/resume",
+            post(api_repo_sessions_resume),
+        )
         .route("/go/{instance_id}/{kind}", get(go))
         .layer(middleware::map_response(harden))
         .with_state(AppState { omp, launcher })
@@ -185,6 +198,58 @@ async fn api_resume(State(omp): State<Shared>, Path(instance_id): Path<String>) 
         Err(e) => (
             StatusCode::BAD_GATEWAY,
             Json(json!({ "error": format!("stopped, but could not restart: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_repo_sessions(State(l): State<Arc<Launcher>>, Path(path): Path<String>) -> Response {
+    // Same rule as api_start: only ever scan for a checkout the scan itself
+    // just listed, never a path taken straight from the request.
+    let repos = l.repos.get().await;
+    let Some(repo) = repos.iter().find(|r| r.path == path) else {
+        return plain(StatusCode::NOT_FOUND, "not a known checkout");
+    };
+    let Some(root) = &l.sessions_root else {
+        return Json(json!({ "sessions": [] })).into_response();
+    };
+    let entries = sessions::list(root, l.home.as_deref(), std::path::Path::new(&repo.path));
+    Json(json!({ "sessions": entries })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResumeSessionRequest {
+    session_id: String,
+}
+
+async fn api_repo_sessions_resume(
+    State(omp): State<Shared>,
+    State(l): State<Arc<Launcher>>,
+    Path(path): Path<String>,
+    Json(req): Json<ResumeSessionRequest>,
+) -> Response {
+    let repos = l.repos.get().await;
+    let Some(repo) = repos.iter().find(|r| r.path == path) else {
+        return plain(StatusCode::NOT_FOUND, "not a known checkout");
+    };
+    let Some(root) = &l.sessions_root else {
+        return plain(StatusCode::NOT_FOUND, "no resumable session with that id");
+    };
+    // Re-scan rather than trust anything cached: a session that picked up a
+    // lock file (or vanished) between listing and resuming must not be resumed.
+    let entries = sessions::list(root, l.home.as_deref(), std::path::Path::new(&repo.path));
+    if !entries.iter().any(|e| e.session_id == req.session_id) {
+        return plain(StatusCode::NOT_FOUND, "no resumable session with that id");
+    }
+    match omp
+        .resume(std::path::Path::new(&repo.path), &req.session_id)
+        .await
+    {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({ "resumed": true }))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": e.to_string() })),
         )
             .into_response(),
     }
@@ -357,6 +422,23 @@ mod tests {
         Arc::new(Launcher {
             repos: repos::Cache::new(roots, std::time::Duration::from_secs(30)),
             models: models.iter().map(|m| m.to_string()).collect(),
+            sessions_root: None,
+            home: None,
+        })
+    }
+
+    /// A launcher whose sessions root/home are wired to a tempdir sessions
+    /// layout, for the past-sessions endpoints.
+    fn launcher_with_sessions(
+        roots: Vec<std::path::PathBuf>,
+        sessions_root: std::path::PathBuf,
+        home: std::path::PathBuf,
+    ) -> Arc<Launcher> {
+        Arc::new(Launcher {
+            repos: repos::Cache::new(roots, std::time::Duration::from_secs(30)),
+            models: Vec::new(),
+            sessions_root: Some(sessions_root),
+            home: Some(home),
         })
     }
 
@@ -788,5 +870,188 @@ mod tests {
         assert_eq!(v["repos"], json!([]));
         assert!(v["hint"].as_str().unwrap().contains("roots"));
         assert_eq!(get(bare(), "/api/models").await["models"], json!([]));
+    }
+
+    /// Percent-encodes a path the way `encodeURIComponent` does for the one
+    /// character that matters here: the path separator, which must survive
+    /// as a single route segment.
+    fn encode_path(path: &str) -> String {
+        path.replace('\\', "%5C").replace('/', "%2F")
+    }
+
+    fn write_session_fixture(
+        dir: &std::path::Path,
+        filename: &str,
+        title: &str,
+        id: &str,
+        cwd: &std::path::Path,
+        age_secs: u64,
+    ) {
+        std::fs::create_dir_all(dir).unwrap();
+        let body = format!(
+            "{{\"type\":\"title\",\"v\":1,\"title\":{title},\"source\":\"auto\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}}\n{{\"type\":\"session\",\"version\":3,\"id\":{id},\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":{cwd},\"title\":\"x\",\"titleSource\":\"auto\"}}\n",
+            title = serde_json::to_string(title).unwrap(),
+            id = serde_json::to_string(id).unwrap(),
+            cwd = serde_json::to_string(&cwd.display().to_string()).unwrap(),
+        );
+        let path = dir.join(filename);
+        std::fs::write(&path, body).unwrap();
+        let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    /// A ghq-layout checkout under a tempdir "home", plus a sessions root
+    /// holding two resumable sessions and one still-locked (live) one.
+    fn sessions_layout() -> (tempfile::TempDir, Arc<Launcher>, String) {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(t.path().join("h/o/r/.git")).unwrap();
+        let home = t.path().canonicalize().unwrap();
+        let path = repos::scan(&[t.path().to_path_buf()])[0].path.clone();
+        let sessions_root = t.path().join("sessions");
+        let dir = sessions_root.join("-h-o-r");
+        let repo_path = std::path::Path::new(&path);
+        write_session_fixture(
+            &dir,
+            "2026-01-01T00-00-00-000Z_older.jsonl",
+            "Older session",
+            "older",
+            repo_path,
+            120,
+        );
+        write_session_fixture(
+            &dir,
+            "2026-01-02T00-00-00-000Z_newer.jsonl",
+            "Newer session",
+            "newer",
+            repo_path,
+            10,
+        );
+        write_session_fixture(
+            &dir,
+            "2026-01-03T00-00-00-000Z_locked.jsonl",
+            "Locked session",
+            "locked",
+            repo_path,
+            1,
+        );
+        std::fs::write(
+            dir.join(".2026-01-03T00-00-00-000Z_locked.jsonl.lock.os"),
+            "",
+        )
+        .unwrap();
+        let l = launcher_with_sessions(vec![t.path().to_path_buf()], sessions_root, home);
+        (t, l, path)
+    }
+
+    #[tokio::test]
+    async fn repo_sessions_lists_resumable_sessions_excluding_locked_ones() {
+        let (_t, l, path) = sessions_layout();
+        let omp = fixture();
+        let (status, _, body) = {
+            let app = router(omp.clone(), l.clone());
+            let req = Request::get(format!("/api/repos/{}/sessions", encode_path(&path)))
+                .body(Body::empty())
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let (parts, body) = res.into_parts();
+            let bytes = to_bytes(body, usize::MAX).await.unwrap();
+            (
+                parts.status,
+                parts.headers,
+                String::from_utf8_lossy(&bytes).into_owned(),
+            )
+        };
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let ids: Vec<&str> = v["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["sessionId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["newer", "older"]);
+        assert_eq!(v["sessions"][0]["title"], "Newer session");
+    }
+
+    #[tokio::test]
+    async fn repo_sessions_rejects_unknown_checkout_paths() {
+        let (_t, l, _path) = sessions_layout();
+        let omp = fixture();
+        let (status, _) = call(
+            router(omp.clone(), l.clone()),
+            Request::get("/api/repos/%2Fnowhere/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn repo_sessions_is_an_empty_list_without_a_configured_sessions_root() {
+        let (_t, l, path) = one_checkout();
+        let omp = fixture();
+        let (status, body) = call(
+            router(omp.clone(), l.clone()),
+            Request::get(format!("/api/repos/{}/sessions", encode_path(&path)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["sessions"],
+            json!([])
+        );
+    }
+
+    async fn post_resume_session(
+        omp: &Arc<FakeOmp>,
+        l: &Arc<Launcher>,
+        path: &str,
+        session_id: &str,
+    ) -> (StatusCode, String) {
+        let req = Request::post(format!("/api/repos/{}/sessions/resume", encode_path(path)))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "session_id": session_id }).to_string()))
+            .unwrap();
+        call(router(omp.clone(), l.clone()), req).await
+    }
+
+    #[tokio::test]
+    async fn resume_session_starts_the_named_past_session_without_stopping_anything() {
+        let (_t, l, path) = sessions_layout();
+        let omp = fixture();
+        let (status, body) = post_resume_session(&omp, &l, &path, "newer").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.contains("\"resumed\":true"));
+        assert_eq!(
+            *omp.resumes.lock(),
+            vec![(std::path::PathBuf::from(&path), "newer".to_string())]
+        );
+        assert!(omp.stops.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_session_rejects_an_id_the_rescan_does_not_list() {
+        let (_t, l, path) = sessions_layout();
+        let omp = fixture();
+        for bad in ["locked", "unknown-id", "../escape"] {
+            let (status, _) = post_resume_session(&omp, &l, &path, bad).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{bad}");
+        }
+        assert!(omp.resumes.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_session_rejects_unknown_checkout_paths_without_calling_resume() {
+        let (_t, l, _path) = sessions_layout();
+        let omp = fixture();
+        let (status, _) = post_resume_session(&omp, &l, "/nowhere", "newer").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(omp.resumes.lock().is_empty());
     }
 }

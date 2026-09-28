@@ -53,6 +53,7 @@ code { font-family: ui-monospace, monospace; }
 <summary>New session</summary>
 <form id="ns-form">
 <label>Repository <input type="search" id="ns-filter" placeholder="Filter by owner/name" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search" aria-label="Filter repositories"><select id="ns-repo" required></select></label>
+<label id="ns-resume-label" hidden>Resume a past session <select id="ns-resume"><option value="">(start new session)</option></select></label>
 <label id="ns-model-label" hidden>Model <select id="ns-model"><option value="">(omp default)</option></select></label>
 <button type="submit" id="ns-go" disabled>Start omp</button>
 <p id="ns-status" role="status"></p>
@@ -66,9 +67,12 @@ code { font-family: ui-monospace, monospace; }
   var filter = document.getElementById("ns-filter");
   var model = document.getElementById("ns-model");
   var modelLabel = document.getElementById("ns-model-label");
+  var resume = document.getElementById("ns-resume");
+  var resumeLabel = document.getElementById("ns-resume-label");
   var go = document.getElementById("ns-go");
   var status = document.getElementById("ns-status");
   var loaded = false;
+  var sessionsFor = null;
   function say(text, err) { status.textContent = text; status.className = err ? "err" : ""; }
   function opt(value, text) { var o = document.createElement("option"); o.value = value; o.textContent = text; return o; }
   var allRepos = [];
@@ -95,10 +99,35 @@ code { font-family: ui-monospace, monospace; }
       if (prev && shown.some(function (r) { return r.path === prev; })) repo.value = prev;
     }
     go.disabled = !repo.value;
+    maybeLoadSessions();
   }
   filter.addEventListener("input", renderRepos);
   // Enter in the filter box would submit the form and start omp on whatever is selected.
   filter.addEventListener("keydown", function (ev) { if (ev.key === "Enter") ev.preventDefault(); });
+  // Past sessions for the currently selected repo, refetched only when the
+  // selection actually changes (renderRepos runs on every filter keystroke).
+  function maybeLoadSessions() {
+    if (repo.value === sessionsFor) return;
+    sessionsFor = repo.value;
+    resume.textContent = "";
+    resume.appendChild(opt("", "(start new session)"));
+    resumeLabel.hidden = true;
+    go.textContent = "Start omp";
+    if (!repo.value) return;
+    fetch("/api/repos/" + encodeURIComponent(repo.value) + "/sessions")
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (repo.value !== sessionsFor) return; // selection moved on while this was in flight
+        var list = data.sessions || [];
+        list.forEach(function (s) { resume.appendChild(opt(s.sessionId, s.title)); });
+        resumeLabel.hidden = list.length === 0;
+      })
+      .catch(function () { resumeLabel.hidden = true; });
+  }
+  repo.addEventListener("change", maybeLoadSessions);
+  resume.addEventListener("change", function () {
+    go.textContent = resume.value ? "Resume omp" : "Start omp";
+  });
   box.addEventListener("toggle", function () {
     if (!box.open || loaded) return;
     loaded = true;
@@ -117,13 +146,21 @@ code { font-family: ui-monospace, monospace; }
   document.getElementById("ns-form").addEventListener("submit", function (ev) {
     ev.preventDefault();
     go.disabled = true;
-    say("starting...", false);
-    fetch("/api/sessions", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ path: repo.value, model: model.value || null })
-    }).then(function (r) {
-      if (r.status === 202) { say("started; it should appear below shortly", false); box.open = false; setTimeout(function () { location.reload(); }, 3000); return; }
+    var sessionId = resume.value;
+    say(sessionId ? "resuming..." : "starting...", false);
+    var req = sessionId
+      ? fetch("/api/repos/" + encodeURIComponent(repo.value) + "/sessions/resume", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId })
+        })
+      : fetch("/api/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ path: repo.value, model: model.value || null })
+        });
+    req.then(function (r) {
+      if (r.status === 202) { say((sessionId ? "resuming" : "started") + "; it should appear below shortly", false); box.open = false; setTimeout(function () { location.reload(); }, 3000); return; }
       return r.text().then(function (t) { say("failed (" + r.status + "): " + t, true); });
     }).catch(function (e) { say("failed: " + e, true); }).then(function () { go.disabled = !repo.value; });
   });

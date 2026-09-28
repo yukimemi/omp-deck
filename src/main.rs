@@ -109,6 +109,8 @@ async fn serve(
     let launcher = Arc::new(Launcher {
         repos: repos::Cache::new(config.repos.roots, REPO_SCAN_TTL),
         models: config.models.list,
+        sessions_root: omp_deck::sessions::default_root(),
+        home: dirs::home_dir(),
     });
     let tailscale = if bind.is_none() {
         tailscale_ip_output().await
