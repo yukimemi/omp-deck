@@ -223,6 +223,17 @@ pub fn successor_args(
 /// after. If the child itself fails to start (a panic on its own startup
 /// path, say), nothing reports that beyond its own stderr -- there is no one
 /// left mid-handover to tell.
+///
+/// Detached from this process's controlling terminal: `serve` is routinely
+/// started from an interactive (or SSH) session precisely so an operator can
+/// watch it start, and by default a spawned child inherits its parent's
+/// process group, so it would sit in that same terminal's foreground group.
+/// Closing that session sends `SIGHUP` to that group, which would take the
+/// successor down with it moments after the handover -- exactly the
+/// disconnect-and-lose-the-dashboard failure this whole feature exists to
+/// let an operator walk away from. Putting the child in its own process
+/// group (Unix) / its own process group detached from any console
+/// (Windows) keeps it alive after the terminal that started `serve` closes.
 pub fn spawn_successor(
     exe: &std::path::Path,
     bind: std::net::SocketAddr,
@@ -233,8 +244,29 @@ pub fn spawn_successor(
     let mut cmd = std::process::Command::new(exe);
     cmd.args(successor_args(bind, omp, config));
     cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
     if let Some(webhook) = discord_webhook {
         cmd.env("OMP_DECK_DISCORD_WEBHOOK", webhook);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // New process group (pgid = the child's own pid), so a SIGHUP sent
+        // to the launching terminal's foreground group on hangup does not
+        // reach the successor.
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: no console, and not
+        // part of the launching console's process group, so a console
+        // close (which sends CTRL_CLOSE_EVENT to that group) does not reach
+        // the successor either.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
     cmd.spawn()?;
     Ok(())
