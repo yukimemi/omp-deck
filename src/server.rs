@@ -45,6 +45,7 @@ pub fn router(omp: Arc<dyn Omp>, launcher: Arc<Launcher>) -> Router {
         .route("/api/models", get(api_models))
         .route("/api/sessions", post(api_start))
         .route("/api/sessions/{instance_id}", delete(api_stop))
+        .route("/api/sessions/{instance_id}/resume", post(api_resume))
         .route("/go/{instance_id}/{kind}", get(go))
         .layer(middleware::map_response(harden))
         .with_state(AppState { omp, launcher })
@@ -125,6 +126,65 @@ async fn api_stop(State(omp): State<Shared>, Path(instance_id): Path<String>) ->
         Err(e) => (
             StatusCode::BAD_GATEWAY,
             Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Only characters `omp` session ids are known to use, and never a leading
+/// `-` (which `--resume=<value>` already neutralizes, but a hand-checked
+/// value is one less thing to trust from a subprocess's stdout).
+fn valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+async fn api_resume(State(omp): State<Shared>, Path(instance_id): Path<String>) -> Response {
+    // Same rule as api_stop and go: only ever act on a pid/cwd/session id
+    // omp itself just reported for this instance id, never the request's.
+    let hosts: Vec<Host> = match omp.list().await {
+        Ok(h) => h,
+        Err(e) => return plain(StatusCode::BAD_GATEWAY, &e.to_string()),
+    };
+    let Some(host) = hosts.iter().find(|h| h.instance_id == instance_id) else {
+        return plain(StatusCode::NOT_FOUND, "no such live omp session");
+    };
+    let Some(pid) = host.pid else {
+        return plain(
+            StatusCode::BAD_GATEWAY,
+            "omp did not report a pid for this session",
+        );
+    };
+    if host.cwd.is_empty() {
+        return plain(
+            StatusCode::BAD_GATEWAY,
+            "omp did not report a cwd for this session",
+        );
+    }
+    if !valid_session_id(&host.session_id) {
+        return plain(
+            StatusCode::BAD_GATEWAY,
+            "omp did not report a usable session id",
+        );
+    }
+    if let Err(e) = omp.stop(pid).await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
+    match omp
+        .resume(std::path::Path::new(&host.cwd), &host.session_id)
+        .await
+    {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({ "resumed": true }))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("stopped, but could not restart: {e}") })),
         )
             .into_response(),
     }
@@ -220,6 +280,11 @@ mod tests {
         start_error: Option<String>,
         stops: Mutex<Vec<u32>>,
         stop_error: Option<String>,
+        resumes: Mutex<Vec<(std::path::PathBuf, String)>>,
+        resume_error: Option<String>,
+        /// Records "stop"/"resume" in call order, so tests can pin that a
+        /// resume request stops the old process before starting a new one.
+        calls: Mutex<Vec<&'static str>>,
     }
 
     impl FakeOmp {
@@ -231,6 +296,9 @@ mod tests {
                 start_error: None,
                 stops: Mutex::new(Vec::new()),
                 stop_error: None,
+                resumes: Mutex::new(Vec::new()),
+                resume_error: None,
+                calls: Mutex::new(Vec::new()),
             })
         }
     }
@@ -260,6 +328,7 @@ mod tests {
             Ok(())
         }
         async fn stop(&self, pid: u32) -> Result<(), OmpError> {
+            self.calls.lock().push("stop");
             if let Some(stderr) = &self.stop_error {
                 return Err(OmpError::Exit {
                     code: Some(4),
@@ -267,6 +336,19 @@ mod tests {
                 });
             }
             self.stops.lock().push(pid);
+            Ok(())
+        }
+        async fn resume(&self, cwd: &std::path::Path, session_id: &str) -> Result<(), OmpError> {
+            self.calls.lock().push("resume");
+            if let Some(stderr) = &self.resume_error {
+                return Err(OmpError::Exit {
+                    code: Some(5),
+                    stderr: stderr.clone(),
+                });
+            }
+            self.resumes
+                .lock()
+                .push((cwd.to_path_buf(), session_id.to_string()));
             Ok(())
         }
     }
@@ -417,10 +499,125 @@ mod tests {
             start_error: None,
             stops: Mutex::new(Vec::new()),
             stop_error: Some("access denied".into()),
+            resumes: Mutex::new(Vec::new()),
+            resume_error: None,
+            calls: Mutex::new(Vec::new()),
         });
         let (status, body) = delete_path(&omp, "/api/sessions/inst-aaa").await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(body.contains("access denied"));
+    }
+
+    async fn resume_path(omp: &Arc<FakeOmp>, path: &str) -> (StatusCode, String) {
+        let req = Request::post(path).body(Body::empty()).unwrap();
+        call(router(omp.clone(), launcher(Vec::new(), &[])), req).await
+    }
+
+    #[tokio::test]
+    async fn resume_stops_then_restarts_the_listed_instance() {
+        let omp = fixture();
+        let (status, body) = resume_path(&omp, "/api/sessions/inst-aaa/resume").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.contains("\"resumed\":true"));
+        assert_eq!(*omp.stops.lock(), vec![4242]);
+        assert_eq!(
+            *omp.resumes.lock(),
+            vec![(
+                std::path::PathBuf::from("C:\\Users\\yukimemi\\src\\github.com\\yukimemi\\omp-deck"),
+                "sess-1".to_string()
+            )]
+        );
+        assert_eq!(*omp.calls.lock(), vec!["stop", "resume"]);
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_unknown_instances_without_calling_stop_or_resume() {
+        let omp = fixture();
+        let (status, _) = resume_path(&omp, "/api/sessions/unknown/resume").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(omp.calls.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_502s_without_calling_stop_when_the_host_is_missing_pid_cwd_or_session_id() {
+        for (mutate, hint) in [
+            (
+                (|h: &mut Host| h.pid = None) as fn(&mut Host),
+                "pid",
+            ),
+            ((|h: &mut Host| h.cwd = String::new()) as fn(&mut Host), "cwd"),
+            (
+                (|h: &mut Host| h.session_id = String::new()) as fn(&mut Host),
+                "session id",
+            ),
+            (
+                (|h: &mut Host| h.session_id = "-x".to_string()) as fn(&mut Host),
+                "session id",
+            ),
+            (
+                (|h: &mut Host| h.session_id = "sess;rm -rf".to_string()) as fn(&mut Host),
+                "session id",
+            ),
+        ] {
+            let mut hosts = parse_hosts(FIXTURE).unwrap();
+            mutate(&mut hosts[0]);
+            let omp = FakeOmp::new(Ok(hosts));
+            let (status, body) = resume_path(&omp, "/api/sessions/inst-aaa/resume").await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{hint}");
+            assert!(body.contains(hint), "{hint}: {body}");
+            assert!(omp.calls.lock().is_empty(), "{hint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_does_not_start_a_new_process_when_stop_fails() {
+        let omp = Arc::new(FakeOmp {
+            hosts: Ok(parse_hosts(FIXTURE).unwrap()),
+            links: Mutex::new(Vec::new()),
+            starts: Mutex::new(Vec::new()),
+            start_error: None,
+            stops: Mutex::new(Vec::new()),
+            stop_error: Some("access denied".into()),
+            resumes: Mutex::new(Vec::new()),
+            resume_error: None,
+            calls: Mutex::new(Vec::new()),
+        });
+        let (status, body) = resume_path(&omp, "/api/sessions/inst-aaa/resume").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.contains("access denied"));
+        assert!(omp.resumes.lock().is_empty());
+        assert_eq!(*omp.calls.lock(), vec!["stop"]);
+    }
+
+    #[tokio::test]
+    async fn resume_502s_mentioning_stopped_when_restart_fails() {
+        let omp = Arc::new(FakeOmp {
+            hosts: Ok(parse_hosts(FIXTURE).unwrap()),
+            links: Mutex::new(Vec::new()),
+            starts: Mutex::new(Vec::new()),
+            start_error: None,
+            stops: Mutex::new(Vec::new()),
+            stop_error: None,
+            resumes: Mutex::new(Vec::new()),
+            resume_error: Some("no console".into()),
+            calls: Mutex::new(Vec::new()),
+        });
+        let (status, body) = resume_path(&omp, "/api/sessions/inst-aaa/resume").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.contains("stopped"));
+        assert!(body.contains("no console"));
+        assert_eq!(*omp.calls.lock(), vec!["stop", "resume"]);
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_get() {
+        let omp = fixture();
+        let req = Request::get("/api/sessions/inst-aaa/resume")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = call(router(omp.clone(), launcher(Vec::new(), &[])), req).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert!(omp.calls.lock().is_empty());
     }
 
     #[tokio::test]
@@ -549,6 +746,9 @@ mod tests {
             start_error: Some("no console".into()),
             stops: Mutex::new(Vec::new()),
             stop_error: None,
+            resumes: Mutex::new(Vec::new()),
+            resume_error: None,
+            calls: Mutex::new(Vec::new()),
         });
         let (status, body) = post_session(&omp, &l, json!({ "path": path })).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);

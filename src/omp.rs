@@ -57,12 +57,24 @@ pub trait Omp: Send + Sync {
     async fn start(&self, cwd: &Path, model: Option<&str>) -> Result<(), OmpError>;
     /// End a session by killing its process. `omp collab` has no remote
     /// stop command, so this kills the OS process at the pid `list` last
-    /// reported for it. Already-gone is success, not an error.
+    /// reported for it. Already-gone is success, not an error. Waits (up to
+    /// [`STOP_WAIT`]) for the pid to actually disappear before returning, so
+    /// callers that stop-then-start know the old process is gone and won't
+    /// race a fresh one over the same session.
     async fn stop(&self, pid: u32) -> Result<(), OmpError>;
+    /// Reopen a saved session by id: `omp --cwd <cwd> --resume=<session_id>`,
+    /// detached, same as `start`. `omp` restores the session's own saved
+    /// model on resume, so no model is passed here. Does not touch any
+    /// existing process for that session; callers that want to replace a
+    /// live one call `stop` first.
+    async fn resume(&self, cwd: &Path, session_id: &str) -> Result<(), OmpError>;
 }
 
 /// How long `start` watches the launcher for an immediate failure.
 const START_WATCH: Duration = Duration::from_secs(2);
+
+/// How long `stop` waits for a killed pid to actually disappear.
+const STOP_WAIT: Duration = Duration::from_secs(5);
 
 /// Characters that cannot be passed safely through `cmd.exe`'s command line.
 #[cfg(any(windows, test))]
@@ -167,6 +179,18 @@ impl Omp for RealOmp {
             .await
             .map_err(|e| OmpError::Spawn(e.to_string()))?
     }
+
+    async fn resume(&self, cwd: &Path, session_id: &str) -> Result<(), OmpError> {
+        let exe = self.resolve()?;
+        let args = vec![
+            "--cwd".to_string(),
+            cwd.display().to_string(),
+            format!("--resume={session_id}"),
+        ];
+        tokio::task::spawn_blocking(move || spawn_detached(&exe, &args))
+            .await
+            .map_err(|e| OmpError::Spawn(e.to_string()))?
+    }
 }
 
 /// Windows: `omp` is a TUI that exits (as if hung up) when it has no console
@@ -226,7 +250,7 @@ fn kill_pid(pid: u32) -> Result<(), OmpError> {
         .stdout(std::process::Stdio::null());
     let output = cmd.output().map_err(|e| OmpError::Spawn(e.to_string()))?;
     if output.status.success() || output.status.code() == Some(128) {
-        return Ok(());
+        return wait_pid_gone(pid);
     }
     Err(OmpError::Exit {
         code: output.status.code(),
@@ -247,7 +271,7 @@ fn kill_pid(pid: u32) -> Result<(), OmpError> {
         .output()
         .map_err(|e| OmpError::Spawn(e.to_string()))?;
     if output.status.success() {
-        return Ok(());
+        return wait_pid_gone(pid);
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     if stderr.contains("No such process") {
@@ -257,6 +281,45 @@ fn kill_pid(pid: u32) -> Result<(), OmpError> {
         code: output.status.code(),
         stderr: stderr.trim().chars().take(500).collect(),
     })
+}
+
+/// Whether `pid` still names a live process.
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .stdin(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+        Err(_) => false,
+    }
+}
+
+/// Whether `pid` still names a live process, via the no-op `kill -0`.
+#[cfg(not(windows))]
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Poll for a just-killed pid to actually disappear, up to [`STOP_WAIT`].
+/// A pid still alive after that is reported as a timeout rather than success,
+/// so a caller that chains a fresh `start`/`resume` onto `stop` never races
+/// the old process over the same session.
+fn wait_pid_gone(pid: u32) -> Result<(), OmpError> {
+    let deadline = std::time::Instant::now() + STOP_WAIT;
+    while pid_alive(pid) {
+        if std::time::Instant::now() >= deadline {
+            return Err(OmpError::Timeout);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
 }
 
 /// Spawn and report a failure that happens within `START_WATCH`.

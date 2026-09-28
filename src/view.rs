@@ -107,11 +107,19 @@ fn render_card(host: &Host, now_ms: i64) -> String {
              rel=\"noopener noreferrer\">{kind}</a>"
         )
     };
+    // Resuming needs both a pid to stop and a session id to reopen; omp
+    // reports both once the session exists, but a card without them can't
+    // offer a resume that would actually work.
+    let resume = if host.pid.is_some() && !host.session_id.is_empty() {
+        format!("<button type=\"button\" class=\"resume\" data-id=\"{id}\">resume</button>")
+    } else {
+        String::new()
+    };
     format!(
         "<article class=\"card {class}\">\n\
          <header><h2 title=\"{cwd}\">{name}</h2><span class=\"badge {class}\">{label}</span></header>\n\
          <p class=\"meta\">{meta}</p>\n\
-         <p class=\"links\">{view}{control}<button type=\"button\" class=\"stop\" \
+         <p class=\"links\">{view}{control}{resume}<button type=\"button\" class=\"stop\" \
          data-id=\"{id}\">close</button></p>\n\
          </article>\n",
         class = status.class(),
@@ -241,6 +249,28 @@ mod tests {
         assert!(html.contains("started 5m ago"));
         assert!(html.contains("anthropic/claude-x"));
         assert!(!html.contains("my.omp.sh"));
+    }
+
+    #[test]
+    fn card_has_a_resume_button_only_with_a_pid_and_session_id() {
+        let hosts = parse_hosts(FIXTURE).unwrap();
+        let html = render_page(&hosts, NOW);
+        assert_eq!(html.matches("class=\"resume\"").count(), 2);
+        assert!(html.contains("class=\"resume\" data-id=\"inst-aaa\""));
+        assert!(html.contains("class=\"resume\" data-id=\"inst-bbb\""));
+
+        let mut no_pid = hosts.clone();
+        no_pid[0].pid = None;
+        assert_eq!(render_page(&no_pid, NOW).matches("class=\"resume\"").count(), 1);
+
+        let mut no_session = hosts;
+        no_session[0].session_id = String::new();
+        assert_eq!(
+            render_page(&no_session, NOW)
+                .matches("class=\"resume\"")
+                .count(),
+            1
+        );
     }
 
     #[test]

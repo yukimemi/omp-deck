@@ -278,6 +278,13 @@ mod tests {
         async fn stop(&self, _pid: u32) -> Result<(), crate::omp::OmpError> {
             unreachable!("notify never stops sessions")
         }
+        async fn resume(
+            &self,
+            _cwd: &std::path::Path,
+            _session_id: &str,
+        ) -> Result<(), crate::omp::OmpError> {
+            unreachable!("notify never resumes sessions")
+        }
     }
 
     /// End-to-end: a real HTTP POST lands on a real local server, with the
