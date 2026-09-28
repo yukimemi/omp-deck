@@ -34,23 +34,17 @@ pub fn default_root() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".omp").join("agent").join("sessions"))
 }
 
-/// The directory name `omp` derives from a cwd: the path relative to `$HOME`
-/// with each separator replaced by `-` and a leading `-` (e.g. under
-/// `$HOME` = `/Users/yukimemi`, `/Users/yukimemi/src/x` -> `-src-x`, and
-/// `$HOME` itself -> `-`).
-///
-/// A cwd outside `$HOME` is not confirmed against a real `omp` (the one
-/// observed case did not follow this rule at all), so it falls back to the
-/// same scheme applied to the absolute path, dropping the root/prefix
-/// component so the result never contains a separator itself. A wrong guess
-/// here only ever makes [`list`] return nothing for that repo -- every entry
-/// it does return is cross-checked against the session's own recorded `cwd`.
-fn sanitize_cwd(home: Option<&Path>, cwd: &Path) -> String {
-    let rel = home.and_then(|h| cwd.strip_prefix(h).ok());
-    let base = rel.unwrap_or(cwd);
+/// The directory name `omp` derives from a cwd under `$HOME`: the path
+/// relative to `$HOME` with each separator replaced by `-` and a leading `-`
+/// (e.g. under `$HOME` = `/Users/yukimemi`, `/Users/yukimemi/src/x` ->
+/// `-src-x`, and `$HOME` itself -> `-`). Only ever called once `repo_path`
+/// is confirmed to start with `home`; there is no confirmed rule for a cwd
+/// outside `$HOME` (see [`list`]).
+fn sanitize_cwd(home: &Path, cwd: &Path) -> String {
+    let rel = cwd.strip_prefix(home).unwrap_or(cwd);
     let mut out = String::from("-");
     let mut first = true;
-    for part in base.components() {
+    for part in rel.components() {
         let Component::Normal(seg) = part else {
             continue;
         };
@@ -113,17 +107,49 @@ fn cwd_matches(repo_path: &Path, record_cwd: &str) -> bool {
     canon(repo_path) == canon(candidate)
 }
 
-/// Resumable sessions for `repo_path`, newest first: every `.jsonl` file in
-/// its sessions directory that has no live `.<name>.jsonl.lock.os` lock next
-/// to it, whose filename-derived id and recorded `cwd` both match. A missing
-/// or unreadable directory, or a file this module cannot parse, contributes
+/// Resumable sessions for `repo_path`, newest first: every `.jsonl` file
+/// belonging to it that has no live `.<name>.jsonl.lock.os` lock next to it,
+/// whose filename-derived id and recorded `cwd` both match. A missing or
+/// unreadable directory, or a file this module cannot parse, contributes
 /// nothing rather than failing the whole list.
+///
+/// For a `repo_path` under `$HOME`, this looks only inside the one directory
+/// [`sanitize_cwd`] derives -- confirmed against a real `omp`. For a
+/// `repo_path` outside `$HOME` (or with no `$HOME` resolved at all), there is
+/// no confirmed naming rule to derive that one directory from, so every
+/// project directory under `sessions_root` is scanned instead; this is still
+/// safe because every candidate file is cross-checked against its own
+/// recorded `cwd`, exactly as in the single-directory case, so a session
+/// belonging to some other project is never picked up by mistake.
 pub fn list(sessions_root: &Path, home: Option<&Path>, repo_path: &Path) -> Vec<SessionEntry> {
-    let dir = sessions_root.join(sanitize_cwd(home, repo_path));
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
+    match home.filter(|h| repo_path.starts_with(h)) {
+        Some(home) => collect_dir(
+            &sessions_root.join(sanitize_cwd(home, repo_path)),
+            repo_path,
+            &mut out,
+        ),
+        None => {
+            if let Ok(entries) = std::fs::read_dir(sessions_root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        collect_dir(&path, repo_path, &mut out);
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by_key(|e| std::cmp::Reverse(e.updated_at_ms));
+    out
+}
+
+/// Appends every resumable, cross-checked session in one project directory
+/// to `out`. A missing/unreadable directory contributes nothing.
+fn collect_dir(dir: &Path, repo_path: &Path, out: &mut Vec<SessionEntry>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -164,8 +190,6 @@ pub fn list(sessions_root: &Path, home: Option<&Path>, repo_path: &Path) -> Vec<
             updated_at_ms,
         });
     }
-    out.sort_by_key(|e| std::cmp::Reverse(e.updated_at_ms));
-    out
 }
 
 #[cfg(test)]
@@ -205,18 +229,73 @@ mod tests {
     fn sanitizes_a_home_relative_cwd() {
         let home = Path::new("/Users/yukimemi");
         assert_eq!(
-            sanitize_cwd(Some(home), Path::new("/Users/yukimemi/src/x/y")),
+            sanitize_cwd(home, Path::new("/Users/yukimemi/src/x/y")),
             "-src-x-y"
         );
-        assert_eq!(sanitize_cwd(Some(home), home), "-");
+        assert_eq!(sanitize_cwd(home, home), "-");
     }
 
     #[test]
-    fn sanitizes_a_cwd_outside_home_without_producing_a_separator() {
-        let home = Path::new("/Users/yukimemi");
-        let name = sanitize_cwd(Some(home), Path::new("/tmp"));
-        assert!(!name.contains('/'), "{name:?}");
-        assert!(!name.contains('\\'), "{name:?}");
+    fn finds_a_repo_outside_home_by_scanning_every_project_directory() {
+        // The real directory name `omp` would use for a cwd outside `$HOME`
+        // is not confirmed (see `list`'s doc comment), so this deliberately
+        // uses a directory name that does *not* follow the home-relative
+        // scheme at all, to prove the match comes from the recorded `cwd`
+        // cross-check rather than from guessing that name.
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let repo = t.path().join("elsewhere").join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        let root = t.path().join("sessions");
+        let dir = root.join("whatever-omp-actually-calls-it");
+        write_session(
+            &dir,
+            "2026-01-01T00-00-00-000Z_outside.jsonl",
+            Some("Outside home"),
+            "outside",
+            &repo,
+            1,
+        );
+        let entries = list(&root, Some(&home), &repo);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, "outside");
+    }
+
+    #[test]
+    fn scanning_every_project_directory_still_excludes_locked_and_mismatched() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let repo = t.path().join("elsewhere").join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        let root = t.path().join("sessions");
+        let dir = root.join("some-guess");
+        write_session(
+            &dir,
+            "2026-01-01T00-00-00-000Z_locked.jsonl",
+            Some("Locked"),
+            "locked",
+            &repo,
+            1,
+        );
+        std::fs::write(
+            dir.join(".2026-01-01T00-00-00-000Z_locked.jsonl.lock.os"),
+            "",
+        )
+        .unwrap();
+        let other = t.path().join("elsewhere").join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        write_session(
+            &root.join("another-guess"),
+            "2026-01-02T00-00-00-000Z_other.jsonl",
+            Some("Other repo"),
+            "other",
+            &other,
+            1,
+        );
+        // No $HOME at all: every project directory must still be scanned.
+        assert!(list(&root, None, &repo).is_empty());
     }
 
     #[test]
