@@ -29,6 +29,8 @@ h1 { font-size: 1.2rem; margin: 0 0 1rem; }
 .links a.control { background: var(--fg); color: var(--bg); }
 .links button.stop { flex: 1; min-width: 0; text-align: center; padding: .5rem; border: 1px solid #c92a2a; border-radius: .4rem; background: var(--card); color: #c92a2a; font: inherit; font-weight: 600; cursor: pointer; }
 .links button.stop:disabled { opacity: .5; cursor: default; }
+.links button.resume { flex: 1; min-width: 0; text-align: center; padding: .5rem; border: 1px solid #1971c2; border-radius: .4rem; background: var(--card); color: #1971c2; font: inherit; font-weight: 600; cursor: pointer; }
+.links button.resume:disabled { opacity: .5; cursor: default; }
 .note { padding: 1rem; border: 1px dashed var(--line); border-radius: .6rem; color: var(--muted); }
 .error { padding: 1rem; border: 2px solid #c92a2a; border-radius: .6rem; }
 .error pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: .5rem 0 0; }
@@ -135,11 +137,16 @@ code { font-family: ui-monospace, monospace; }
   // tab regains visibility picks that up immediately.
   document.addEventListener("visibilitychange", maybeReload);
   document.addEventListener("click", function (ev) {
-    var btn = ev.target.closest("button.stop");
+    var btn = ev.target.closest("button.stop, button.resume");
     if (!btn) return;
-    if (!window.confirm("Close this omp session? This ends it for everyone.")) return;
+    var isResume = btn.classList.contains("resume");
+    var prompt = isResume
+      ? "Resume this omp session? It restarts the process (a brief drop, then a fresh session)."
+      : "Close this omp session? This ends it for everyone.";
+    if (!window.confirm(prompt)) return;
     btn.disabled = true;
-    fetch("/api/sessions/" + btn.dataset.id, { method: "DELETE" }).then(function (r) {
+    var url = "/api/sessions/" + btn.dataset.id + (isResume ? "/resume" : "");
+    fetch(url, { method: isResume ? "POST" : "DELETE" }).then(function (r) {
       if (r.status === 202) { location.reload(); return; }
       return r.text().then(function (t) { window.alert("failed (" + r.status + "): " + t); btn.disabled = false; });
     }).catch(function (e) { window.alert("failed: " + e); btn.disabled = false; });

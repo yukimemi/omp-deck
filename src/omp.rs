@@ -57,12 +57,24 @@ pub trait Omp: Send + Sync {
     async fn start(&self, cwd: &Path, model: Option<&str>) -> Result<(), OmpError>;
     /// End a session by killing its process. `omp collab` has no remote
     /// stop command, so this kills the OS process at the pid `list` last
-    /// reported for it. Already-gone is success, not an error.
+    /// reported for it. Already-gone is success, not an error. Waits (up to
+    /// [`STOP_WAIT`]) for the pid to actually disappear before returning, so
+    /// callers that stop-then-start know the old process is gone and won't
+    /// race a fresh one over the same session.
     async fn stop(&self, pid: u32) -> Result<(), OmpError>;
+    /// Reopen a saved session by id: `omp --cwd <cwd> --resume=<session_id>`,
+    /// detached, same as `start`. `omp` restores the session's own saved
+    /// model on resume, so no model is passed here. Does not touch any
+    /// existing process for that session; callers that want to replace a
+    /// live one call `stop` first.
+    async fn resume(&self, cwd: &Path, session_id: &str) -> Result<(), OmpError>;
 }
 
 /// How long `start` watches the launcher for an immediate failure.
 const START_WATCH: Duration = Duration::from_secs(2);
+
+/// How long `stop` waits for a killed pid to actually disappear.
+const STOP_WAIT: Duration = Duration::from_secs(5);
 
 /// Characters that cannot be passed safely through `cmd.exe`'s command line.
 #[cfg(any(windows, test))]
@@ -167,6 +179,18 @@ impl Omp for RealOmp {
             .await
             .map_err(|e| OmpError::Spawn(e.to_string()))?
     }
+
+    async fn resume(&self, cwd: &Path, session_id: &str) -> Result<(), OmpError> {
+        let exe = self.resolve()?;
+        let args = vec![
+            "--cwd".to_string(),
+            cwd.display().to_string(),
+            format!("--resume={session_id}"),
+        ];
+        tokio::task::spawn_blocking(move || spawn_detached(&exe, &args))
+            .await
+            .map_err(|e| OmpError::Spawn(e.to_string()))?
+    }
 }
 
 /// Windows: `omp` is a TUI that exits (as if hung up) when it has no console
@@ -226,7 +250,7 @@ fn kill_pid(pid: u32) -> Result<(), OmpError> {
         .stdout(std::process::Stdio::null());
     let output = cmd.output().map_err(|e| OmpError::Spawn(e.to_string()))?;
     if output.status.success() || output.status.code() == Some(128) {
-        return Ok(());
+        return wait_pid_gone(pid);
     }
     Err(OmpError::Exit {
         code: output.status.code(),
@@ -247,7 +271,7 @@ fn kill_pid(pid: u32) -> Result<(), OmpError> {
         .output()
         .map_err(|e| OmpError::Spawn(e.to_string()))?;
     if output.status.success() {
-        return Ok(());
+        return wait_pid_gone(pid);
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     if stderr.contains("No such process") {
@@ -257,6 +281,45 @@ fn kill_pid(pid: u32) -> Result<(), OmpError> {
         code: output.status.code(),
         stderr: stderr.trim().chars().take(500).collect(),
     })
+}
+
+/// Whether `pid` still names a live process.
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .stdin(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+        Err(_) => false,
+    }
+}
+
+/// Whether `pid` still names a live process, via the no-op `kill -0`.
+#[cfg(not(windows))]
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Poll for a just-killed pid to actually disappear, up to [`STOP_WAIT`].
+/// A pid still alive after that is reported as a timeout rather than success,
+/// so a caller that chains a fresh `start`/`resume` onto `stop` never races
+/// the old process over the same session.
+fn wait_pid_gone(pid: u32) -> Result<(), OmpError> {
+    let deadline = std::time::Instant::now() + STOP_WAIT;
+    while pid_alive(pid) {
+        if std::time::Instant::now() >= deadline {
+            return Err(OmpError::Timeout);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
 }
 
 /// Spawn and report a failure that happens within `START_WATCH`.
@@ -286,8 +349,19 @@ fn watch(mut cmd: std::process::Command) -> Result<(), OmpError> {
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            // Still running: `omp` itself (non-Windows) is up.
-            Ok(None) => return Ok(()),
+            // Still running: `omp` itself (non-Windows) is up. Nothing here
+            // ever calls `wait` on it again, and on Unix an un-waited child
+            // that later exits sits as a zombie — still visible to `kill -0`
+            // — until something reaps it. `stop` polls exactly that signal
+            // to tell a killed process has actually gone, so a background
+            // thread blocked on `wait` is what makes that polling ever see
+            // "gone" once the process exits on its own.
+            Ok(None) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Ok(());
+            }
             Err(e) => return Err(OmpError::Spawn(e.to_string())),
         }
     }
@@ -332,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn stop_kills_a_running_process_and_is_idempotent() {
         let omp = RealOmp::default();
-        let mut child = if cfg!(windows) {
+        let child = if cfg!(windows) {
             std::process::Command::new("cmd")
                 .args(["/c", "ping -n 31 127.0.0.1 >NUL"])
                 .spawn()
@@ -341,15 +415,53 @@ mod tests {
         }
         .unwrap();
         let pid = child.id();
+        // `stop` now waits for the pid to actually disappear, which on Unix
+        // needs *something* to reap it once it exits, same as a spawned
+        // `omp` needs `watch`'s own reaper thread. Here that's this thread,
+        // standing in for whatever normally owns the process (this test's
+        // direct child is unusual; a real target is typically reaped by its
+        // own unrelated parent, not by omp-deck).
+        let reaper = std::thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        });
         assert!(omp.stop(pid).await.is_ok());
-        for _ in 0..20 {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        assert!(matches!(child.try_wait(), Ok(Some(_))), "still running");
+        reaper.join().unwrap();
         // Stopping an already-gone pid is still Ok: idempotent.
         assert!(omp.stop(pid).await.is_ok());
+    }
+
+    // No Windows equivalent of an unkillable-by-terminate process is set up
+    // here; taskkill's own `/F` already forces termination, so the timeout
+    // branch there is unreached in practice, unlike SIGTERM on Unix.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn stop_502s_as_a_timeout_when_the_process_ignores_sigterm() {
+        let omp = RealOmp::default();
+        let mut child = std::process::Command::new("sh")
+            // Prints once the trap is actually installed, so the test never
+            // races the shell's own startup: without this, `stop` can send
+            // SIGTERM before `trap` has run, in which case it kills the
+            // shell normally and the test observes `Ok` instead of the
+            // timeout it means to exercise.
+            .args(["-c", "trap '' TERM; echo ready; sleep 30"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        {
+            use std::io::{BufRead, BufReader};
+            let mut line = String::new();
+            BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line.trim(), "ready");
+        }
+        assert!(matches!(omp.stop(pid).await, Err(OmpError::Timeout)));
+        // Clean up: the process ignored SIGTERM, so SIGKILL it directly.
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .output();
+        let _ = child.wait();
     }
 }
