@@ -59,6 +59,13 @@ omp-deck self-update [--yes] [--check]                       # update the binary
   to once every 24 hours) and prints a banner to stderr pointing at
   `omp-deck self-update` if one exists — never a silent install. Set
   `OMP_DECK_NO_AUTOUPDATE=1` to disable the check entirely.
+- The dashboard's **Update & restart** button (`POST /api/self-update`) does
+  the same install `omp-deck self-update -y` does, but from the phone: it
+  checks for a newer release, and if there is one, installs it and restarts
+  the process in place, listening again on the same address. Answers `200`
+  if already up to date (no restart), `202` once an install has started (the
+  dashboard is briefly unreachable during the handover), `403` if
+  `OMP_DECK_NO_AUTOUPDATE` is set, and `409` if one is already in progress.
 
 ## Starting a session from the dashboard
 

@@ -5,6 +5,7 @@ use crate::model::Host;
 use crate::omp::{Access, Omp, OmpError};
 use crate::repos;
 use crate::sessions;
+use crate::update::{RealUpdater, SelfUpdater};
 use crate::view;
 use axum::{
     Json, Router,
@@ -17,6 +18,8 @@ use axum::{
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::watch;
 
 type Shared = Arc<dyn Omp>;
 
@@ -37,6 +40,12 @@ pub struct Launcher {
 pub struct AppState {
     pub omp: Shared,
     pub launcher: Arc<Launcher>,
+    pub updater: Arc<dyn SelfUpdater>,
+    pub restart_tx: watch::Sender<bool>,
+    /// Guards against a second `/api/self-update` press while an install is
+    /// already running -- an install replaces the on-disk binary and then
+    /// restarts the process, so two overlapping ones would race each other.
+    pub update_in_progress: Arc<AtomicBool>,
 }
 
 impl FromRef<AppState> for Shared {
@@ -45,7 +54,22 @@ impl FromRef<AppState> for Shared {
     }
 }
 
+/// Builds the router with the real `SelfUpdater` and a throwaway restart
+/// channel nobody is watching -- for callers (tests, and any future use that
+/// doesn't care about self-update) that don't need to observe or trigger it.
+/// `omp-deck serve` uses [`router_with_updater`] directly so it can await the
+/// restart signal itself.
 pub fn router(omp: Arc<dyn Omp>, launcher: Arc<Launcher>) -> Router {
+    let (restart_tx, _restart_rx) = watch::channel(false);
+    router_with_updater(omp, launcher, Arc::new(RealUpdater::new()), restart_tx)
+}
+
+pub fn router_with_updater(
+    omp: Arc<dyn Omp>,
+    launcher: Arc<Launcher>,
+    updater: Arc<dyn SelfUpdater>,
+    restart_tx: watch::Sender<bool>,
+) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/hosts", get(api_hosts))
@@ -59,9 +83,16 @@ pub fn router(omp: Arc<dyn Omp>, launcher: Arc<Launcher>) -> Router {
             "/api/repos/{path}/sessions/resume",
             post(api_repo_sessions_resume),
         )
+        .route("/api/self-update", post(api_self_update))
         .route("/go/{instance_id}/{kind}", get(go))
         .layer(middleware::map_response(harden))
-        .with_state(AppState { omp, launcher })
+        .with_state(AppState {
+            omp,
+            launcher,
+            updater,
+            restart_tx,
+            update_in_progress: Arc::new(AtomicBool::new(false)),
+        })
 }
 
 const NO_ROOTS_HINT: &str = "No repository roots configured. Add [repos] roots = [\"...\"] to      the omp-deck config file (see the README).";
@@ -255,6 +286,59 @@ async fn api_repo_sessions_resume(
     }
 }
 
+/// Checks for a newer release and, if there is one, installs it and hands
+/// the dashboard over to a fresh successor process.
+///
+/// Order is the whole design, and it is enforced across two places: this
+/// handler answers 202 and fires the install off in the background (never
+/// blocking the response on it), so the reply reaches the caller before
+/// anything about this process changes; installing then flips `restart_tx`,
+/// which is what `main.rs::serve` is waiting on to stop `axum::serve`'s
+/// graceful shutdown -- only once that future returns is the `TcpListener`
+/// actually dropped, and only then does `main.rs` spawn the successor and
+/// let this process exit. Spawning the successor any earlier would race it
+/// against this process for the port.
+async fn api_self_update(State(state): State<AppState>) -> Response {
+    if state.updater.disabled() {
+        return plain(
+            StatusCode::FORBIDDEN,
+            "self-update disabled (OMP_DECK_NO_AUTOUPDATE)",
+        );
+    }
+    if state.update_in_progress.swap(true, Ordering::SeqCst) {
+        return plain(StatusCode::CONFLICT, "self-update already in progress");
+    }
+    let latest = match state.updater.newer_release().await {
+        Ok(latest) => latest,
+        Err(e) => {
+            state.update_in_progress.store(false, Ordering::SeqCst);
+            return plain(StatusCode::BAD_GATEWAY, &e);
+        }
+    };
+    let Some(latest) = latest else {
+        // Already up to date: restarting now would only drop every open
+        // connection for nothing, so this is the end of the road.
+        state.update_in_progress.store(false, Ordering::SeqCst);
+        return Json(json!({ "updated": false })).into_response();
+    };
+    let updater = state.updater.clone();
+    let restart_tx = state.restart_tx.clone();
+    let in_progress = state.update_in_progress.clone();
+    tokio::spawn(async move {
+        if let Err(e) = updater.install().await {
+            eprintln!("omp-deck: self-update failed: {e}");
+            in_progress.store(false, Ordering::SeqCst);
+            return;
+        }
+        let _ = restart_tx.send(true);
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "updated": true, "tag": latest.tag_name })),
+    )
+        .into_response()
+}
+
 async fn harden(mut res: Response) -> Response {
     let h = res.headers_mut();
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -332,6 +416,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
+    use kaishin::LatestRelease;
     use parking_lot::Mutex;
     use tower::ServiceExt;
 
@@ -415,6 +500,48 @@ mod tests {
                 .lock()
                 .push((cwd.to_path_buf(), session_id.to_string()));
             Ok(())
+        }
+    }
+
+    struct FakeUpdater {
+        disabled: bool,
+        newer: Result<Option<LatestRelease>, String>,
+        install_result: Result<(), String>,
+        newer_calls: Mutex<u32>,
+        installs: Mutex<u32>,
+    }
+
+    impl FakeUpdater {
+        fn new(disabled: bool, newer: Result<Option<LatestRelease>, String>) -> Arc<Self> {
+            Arc::new(Self {
+                disabled,
+                newer,
+                install_result: Ok(()),
+                newer_calls: Mutex::new(0),
+                installs: Mutex::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl SelfUpdater for FakeUpdater {
+        fn disabled(&self) -> bool {
+            self.disabled
+        }
+        async fn newer_release(&self) -> Result<Option<LatestRelease>, String> {
+            *self.newer_calls.lock() += 1;
+            self.newer.clone()
+        }
+        async fn install(&self) -> Result<(), String> {
+            *self.installs.lock() += 1;
+            self.install_result.clone()
+        }
+    }
+
+    fn release(tag: &str) -> LatestRelease {
+        LatestRelease {
+            tag_name: tag.to_string(),
+            html_url: String::new(),
         }
     }
 
@@ -1053,5 +1180,87 @@ mod tests {
         let (status, _) = post_resume_session(&omp, &l, "/nowhere", "newer").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(omp.resumes.lock().is_empty());
+    }
+
+    async fn post_self_update(app: Router) -> (StatusCode, String) {
+        let res = app
+            .oneshot(
+                Request::post("/api/self-update")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (parts, body) = res.into_parts();
+        let bytes = to_bytes(body, usize::MAX).await.unwrap();
+        (parts.status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn self_update_refuses_when_disabled_without_checking_github() {
+        let omp = fixture();
+        let updater = FakeUpdater::new(true, Err("must not be called".to_string()));
+        let (tx, _rx) = watch::channel(false);
+        let app = router_with_updater(omp, launcher(Vec::new(), &[]), updater.clone(), tx);
+        let (status, body) = post_self_update(app).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("OMP_DECK_NO_AUTOUPDATE"));
+        assert_eq!(*updater.newer_calls.lock(), 0);
+        assert_eq!(*updater.installs.lock(), 0);
+    }
+
+    #[tokio::test]
+    async fn self_update_does_nothing_when_already_up_to_date() {
+        let omp = fixture();
+        let updater = FakeUpdater::new(false, Ok(None));
+        let (tx, mut rx) = watch::channel(false);
+        let app = router_with_updater(omp, launcher(Vec::new(), &[]), updater.clone(), tx);
+        let (status, body) = post_self_update(app).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"updated\":false"));
+        assert_eq!(*updater.newer_calls.lock(), 1);
+        assert_eq!(*updater.installs.lock(), 0);
+        assert!(!*rx.borrow_and_update());
+    }
+
+    #[tokio::test]
+    async fn self_update_reports_the_error_when_the_check_fails() {
+        let omp = fixture();
+        let updater = FakeUpdater::new(false, Err("github is down".to_string()));
+        let (tx, _rx) = watch::channel(false);
+        let app = router_with_updater(omp, launcher(Vec::new(), &[]), updater.clone(), tx);
+        let (status, body) = post_self_update(app).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.contains("github is down"));
+        assert_eq!(*updater.installs.lock(), 0);
+    }
+
+    #[tokio::test]
+    async fn self_update_installs_and_triggers_restart_when_a_newer_release_is_found() {
+        let omp = fixture();
+        let updater = FakeUpdater::new(false, Ok(Some(release("v9.9.9"))));
+        let (tx, mut rx) = watch::channel(false);
+        let app = router_with_updater(omp, launcher(Vec::new(), &[]), updater.clone(), tx);
+        let (status, body) = post_self_update(app).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.contains("v9.9.9"));
+        // The install runs in the background; wait for the restart signal
+        // it sends on success rather than sleeping a fixed amount.
+        rx.changed().await.unwrap();
+        assert!(*rx.borrow());
+        assert_eq!(*updater.installs.lock(), 1);
+    }
+
+    #[tokio::test]
+    async fn self_update_second_request_is_rejected_while_the_first_is_in_progress() {
+        let omp = fixture();
+        let updater = FakeUpdater::new(false, Ok(Some(release("v9.9.9"))));
+        let (tx, _rx) = watch::channel(false);
+        let app = router_with_updater(omp, launcher(Vec::new(), &[]), updater.clone(), tx);
+        let (status1, _) = post_self_update(app.clone()).await;
+        assert_eq!(status1, StatusCode::ACCEPTED);
+        let (status2, _) = post_self_update(app).await;
+        assert_eq!(status2, StatusCode::CONFLICT);
+        assert_eq!(*updater.newer_calls.lock(), 1);
     }
 }

@@ -1,17 +1,22 @@
 //! Self-update support for `omp-deck`, using the [`kaishin`] library — the
 //! same self-update integration `renri` and `rvpm` use.
 //!
-//! Two entry points:
+//! Entry points:
 //! - [`run_self_update`] drives the explicit `omp-deck self-update` command.
 //! - [`maybe_spawn_auto_update_check`] / [`finalize_auto_update_check`] run a
 //!   throttled (24h) background version check that prints an update banner
 //!   once the command completes.
+//! - [`SelfUpdater`] (backed by [`RealUpdater`]) is the same check-then-install
+//!   flow, injectable so the web dashboard's `/api/self-update` handler in
+//!   `server.rs` can trigger it and be tested against a fake.
 //!
 //! Unlike `renri`/`rvpm`, `omp-deck` has no config file, so there is only one
-//! mode: check and notify (never a silent background install). Set
-//! `OMP_DECK_NO_AUTOUPDATE=1` to disable the check entirely.
+//! CLI mode: check and notify (never a silent background install). Set
+//! `OMP_DECK_NO_AUTOUPDATE=1` to disable both the CLI check and the web
+//! trigger.
 
-use kaishin::{Checker, KaishinOptions, LatestRelease, UpdateOptions};
+use async_trait::async_trait;
+use kaishin::{Checker, KaishinOptions, LatestRelease, UpdateOptions, check_latest_release};
 use tokio::task::JoinHandle;
 
 fn options() -> KaishinOptions {
@@ -23,16 +28,23 @@ fn options() -> KaishinOptions {
     )
 }
 
-/// Whether `OMP_DECK_NO_AUTOUPDATE` disables the background check. `0`,
-/// `false` (case-insensitive), and unset/blank all count as "not disabled".
-fn auto_update_disabled_by_env() -> bool {
-    match std::env::var("OMP_DECK_NO_AUTOUPDATE") {
-        Ok(v) => {
+/// Pure form of the `OMP_DECK_NO_AUTOUPDATE` check: `0`, `false`
+/// (case-insensitive), and unset/blank all count as "not disabled".
+fn disabled_by(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => {
             let v = v.trim();
             !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
         }
-        Err(_) => false,
+        None => false,
     }
+}
+
+/// Whether `OMP_DECK_NO_AUTOUPDATE` disables the background check (and the
+/// web `/api/self-update` trigger, which refuses outright rather than
+/// silently contacting GitHub).
+fn auto_update_disabled_by_env() -> bool {
+    disabled_by(std::env::var("OMP_DECK_NO_AUTOUPDATE").ok().as_deref())
 }
 
 /// A background update check in flight, or a cached result found within the
@@ -113,4 +125,218 @@ pub async fn run_self_update(yes: bool, check_only: bool) -> Result<(), String> 
     kaishin::run_self_update(&options(), upd_opts)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// The self-update flow the web dashboard's `/api/self-update` handler
+/// drives, injectable so that handler can be tested against a fake instead
+/// of making a real GitHub call or replacing the real binary.
+#[async_trait]
+pub trait SelfUpdater: Send + Sync {
+    /// Whether `OMP_DECK_NO_AUTOUPDATE` refuses updates outright. Checked
+    /// first, and before any network call: a disabled instance must not
+    /// contact GitHub just because a button was pressed.
+    fn disabled(&self) -> bool;
+    /// A real (uncached) check for a newer release. `Ok(None)` means already
+    /// up to date -- nothing to install, nothing to restart.
+    async fn newer_release(&self) -> Result<Option<LatestRelease>, String>;
+    /// Installs the newer release in place and leaves it for the caller to
+    /// hand the listening socket over to a successor process. Non-interactive
+    /// (`yes = true`): nobody is at a terminal to answer a prompt.
+    async fn install(&self) -> Result<(), String>;
+}
+
+/// The real backend, used by `omp-deck serve`.
+#[derive(Default)]
+pub struct RealUpdater;
+
+impl RealUpdater {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl SelfUpdater for RealUpdater {
+    fn disabled(&self) -> bool {
+        auto_update_disabled_by_env()
+    }
+
+    async fn newer_release(&self) -> Result<Option<LatestRelease>, String> {
+        let opts = options();
+        let latest = check_latest_release(&opts)
+            .await
+            .map_err(|e| e.to_string())?;
+        let available = kaishin::is_update_available(&opts.current_version, &latest.tag_name)
+            .map_err(|e| e.to_string())?;
+        Ok(available.then_some(latest))
+    }
+
+    async fn install(&self) -> Result<(), String> {
+        run_self_update(true, false).await
+    }
+}
+
+/// Args for the successor process's own `serve` invocation.
+///
+/// Always binds to `bind` -- the address this process is actually listening
+/// on -- rather than replaying whatever `--bind` (if any) the operator gave
+/// this process: without an explicit `--bind`, `bind.rs::choose_bind` picks
+/// the Tailscale IPv4 address on an OS-chosen port, and a naive `execve`-style
+/// replay would have the successor call `choose_bind` fresh and land on a
+/// *different* random port, breaking the URL the phone was just using.
+/// `--omp`/`--config` are carried over verbatim (both are plain paths); the
+/// Discord webhook is deliberately left out here -- see `spawn_successor`,
+/// which passes it through the environment instead so it never shows up in
+/// a process listing.
+pub fn successor_args(
+    bind: std::net::SocketAddr,
+    omp: Option<&std::path::Path>,
+    config: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(omp) = omp {
+        args.push("--omp".to_string());
+        args.push(omp.display().to_string());
+    }
+    if let Some(config) = config {
+        args.push("--config".to_string());
+        args.push(config.display().to_string());
+    }
+    args.push("serve".to_string());
+    args.push("--bind".to_string());
+    args.push(bind.to_string());
+    args
+}
+
+/// Hands the dashboard over to a freshly spawned copy of this binary, bound
+/// to the same address this process was listening on.
+///
+/// Must only be called after the caller has already dropped its
+/// `TcpListener` (see the doc comment on `/api/self-update` in `server.rs`
+/// for the full handover order and why it matters): the freshly-installed
+/// binary has no bind-retry loop of its own, so spawning it while the port
+/// is still held races it against "address already in use", with nowhere to
+/// report why if it loses.
+///
+/// The child is left to outlive this process (never `wait`ed, never killed
+/// on drop): once this call returns, the caller is expected to exit shortly
+/// after. If the child itself fails to start (a panic on its own startup
+/// path, say), nothing reports that beyond its own stderr -- there is no one
+/// left mid-handover to tell.
+///
+/// Detached from this process's controlling terminal: `serve` is routinely
+/// started from an interactive (or SSH) session precisely so an operator can
+/// watch it start, and by default a spawned child inherits its parent's
+/// process group, so it would sit in that same terminal's foreground group.
+/// Closing that session sends `SIGHUP` to that group, which would take the
+/// successor down with it moments after the handover -- exactly the
+/// disconnect-and-lose-the-dashboard failure this whole feature exists to
+/// let an operator walk away from. Putting the child in its own process
+/// group (Unix) / its own process group detached from any console
+/// (Windows) keeps it alive after the terminal that started `serve` closes.
+///
+/// Only stdin is redirected (to nothing, since nobody is left to type into
+/// it); stdout/stderr are left inherited from this process, so the
+/// successor's own startup banner and update-check banner still land
+/// wherever this process's were going -- a systemd unit's journal, a
+/// container's log driver, a `nohup ... >log 2>&1` redirect. Nulling those
+/// too would silently swallow every log line the next `serve`, and every
+/// one after it, ever writes.
+pub fn spawn_successor(
+    exe: &std::path::Path,
+    bind: std::net::SocketAddr,
+    omp: Option<&std::path::Path>,
+    config: Option<&std::path::Path>,
+    discord_webhook: Option<&str>,
+) -> std::io::Result<()> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(successor_args(bind, omp, config));
+    cmd.stdin(std::process::Stdio::null());
+    if let Some(webhook) = discord_webhook {
+        cmd.env("OMP_DECK_DISCORD_WEBHOOK", webhook);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // New process group (pgid = the child's own pid), so a SIGHUP sent
+        // to the launching terminal's foreground group on hangup does not
+        // reach the successor.
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: no console, and not
+        // part of the launching console's process group, so a console
+        // close (which sends CTRL_CLOSE_EVENT to that group) does not reach
+        // the successor either.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn disabled_by_table() {
+        let cases = [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some("FALSE"), false),
+            (Some("  false  "), false),
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("yes"), true),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(disabled_by(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn successor_args_uses_the_actual_bound_address() {
+        let bind: std::net::SocketAddr = "100.64.0.7:54321".parse().unwrap();
+        assert_eq!(
+            successor_args(bind, None, None),
+            vec!["serve", "--bind", "100.64.0.7:54321"]
+        );
+    }
+
+    #[test]
+    fn successor_args_ignores_port_0_and_carries_over_omp_and_config() {
+        // Even if this process itself was started with no --bind (port 0),
+        // `bind` here is always the real bound port -- never 0.
+        let bind: std::net::SocketAddr = "100.64.0.7:41234".parse().unwrap();
+        let args = successor_args(
+            bind,
+            Some(Path::new("/usr/local/bin/omp")),
+            Some(Path::new("/etc/omp-deck.toml")),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--omp",
+                "/usr/local/bin/omp",
+                "--config",
+                "/etc/omp-deck.toml",
+                "serve",
+                "--bind",
+                "100.64.0.7:41234",
+            ]
+        );
+    }
+
+    #[test]
+    fn successor_args_never_contains_the_webhook() {
+        let args = successor_args("127.0.0.1:8080".parse().unwrap(), None, None);
+        assert!(args.iter().all(|a| !a.contains("discord")));
+    }
 }

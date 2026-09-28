@@ -4,12 +4,11 @@ use omp_deck::config::Config;
 use omp_deck::omp::{Omp, RealOmp};
 use omp_deck::repos;
 use omp_deck::server::Launcher;
+use omp_deck::update::{self, RealUpdater};
 use omp_deck::{notify, now_ms, server, view};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-
-mod update;
 
 const REPO_SCAN_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -67,12 +66,13 @@ async fn main() -> ExitCode {
     } else {
         update::maybe_spawn_auto_update_check()
     };
+    let omp_path = cli.omp.clone();
     let omp = Arc::new(RealOmp::new(cli.omp));
     let result = match cli.command {
         Command::Serve {
             bind,
             discord_webhook,
-        } => serve(omp, bind, discord_webhook, cli.config).await,
+        } => serve(omp, omp_path, bind, discord_webhook, cli.config).await,
         Command::List { json } => list(&omp, json).await,
         Command::SelfUpdate { yes, check } => update::run_self_update(yes, check).await,
     };
@@ -101,11 +101,17 @@ async fn list(omp: &RealOmp, json: bool) -> Result<(), String> {
 
 async fn serve(
     omp: Arc<RealOmp>,
+    omp_path: Option<PathBuf>,
     bind: Option<String>,
     discord_webhook: Option<String>,
-    config: Option<PathBuf>,
+    config_path: Option<PathBuf>,
 ) -> Result<(), String> {
-    let config = Config::load_or_default(config.as_deref()).map_err(|e| format!("{e:#}"))?;
+    // Captured before anything runs: a self-update replaces the on-disk
+    // binary while this process keeps running, and on Linux that turns
+    // `current_exe()` into a `(deleted)`-suffixed path once the original
+    // inode is gone.
+    let exe = std::env::current_exe().map_err(|e| format!("cannot resolve current exe: {e}"))?;
+    let config = Config::load_or_default(config_path.as_deref()).map_err(|e| format!("{e:#}"))?;
     let launcher = Arc::new(Launcher {
         repos: repos::Cache::new(config.repos.roots, REPO_SCAN_TTL),
         models: config.models.list,
@@ -126,10 +132,29 @@ async fn serve(
         .map_err(|e| format!("cannot bind {}: {e}", chosen.addr))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?;
     println!("http://{local}/");
-    if let Some(webhook) = discord_webhook {
-        tokio::spawn(notify::run(omp.clone(), webhook));
+    if let Some(webhook) = &discord_webhook {
+        tokio::spawn(notify::run(omp.clone(), webhook.clone()));
     }
-    axum::serve(listener, server::router(omp, launcher))
+    let (restart_tx, mut restart_rx) = tokio::sync::watch::channel(false);
+    let router =
+        server::router_with_updater(omp, launcher, Arc::new(RealUpdater::new()), restart_tx);
+    // `/api/self-update` (server.rs) flips `restart_tx` once it has replaced
+    // the on-disk binary; only then does the graceful shutdown below let
+    // `axum::serve` return, which drops the `TcpListener` and frees the
+    // port. Only after that does the successor get spawned -- spawning it
+    // any earlier would race it for the port (see `update::spawn_successor`).
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = restart_rx.wait_for(|v| *v).await;
+        })
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    update::spawn_successor(
+        &exe,
+        local,
+        omp_path.as_deref(),
+        config_path.as_deref(),
+        discord_webhook.as_deref(),
+    )
+    .map_err(|e| format!("failed to spawn successor after self-update: {e}"))
 }
