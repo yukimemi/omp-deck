@@ -45,10 +45,19 @@ details#new-session summary { cursor: pointer; font-weight: 600; }
 #ns-status { margin: 0; font-size: .85rem; color: var(--muted); overflow-wrap: anywhere; }
 #ns-status.err { color: #c92a2a; }
 code { font-family: ui-monospace, monospace; }
+#self-update { display: flex; align-items: center; gap: .6rem; margin: 0 0 1rem; }
+#su-btn { font: inherit; padding: .4rem .8rem; border-radius: .4rem; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+#su-btn:disabled { opacity: .5; cursor: default; }
+#su-status { margin: 0; font-size: .85rem; color: var(--muted); overflow-wrap: anywhere; }
+#su-status.err { color: #c92a2a; }
 </style>
 </head>
 <body>
 <h1>omp deck</h1>
+<div id="self-update">
+<button id="su-btn" type="button">Update &amp; restart</button>
+<p id="su-status" role="status"></p>
+</div>
 <details id="new-session">
 <summary>New session</summary>
 <form id="ns-form">
@@ -62,6 +71,26 @@ code { font-family: ui-monospace, monospace; }
 <!--BODY-->
 <script>
 (function () {
+  var suBtn = document.getElementById("su-btn");
+  var suStatus = document.getElementById("su-status");
+  function suSay(text, err) { suStatus.textContent = text; suStatus.className = err ? "err" : ""; }
+  suBtn.addEventListener("click", function () {
+    if (!window.confirm("Check for a newer omp-deck release and restart onto it if found? The dashboard is briefly unreachable during the restart.")) return;
+    suBtn.disabled = true;
+    suSay("checking...", false);
+    fetch("/api/self-update", { method: "POST" }).then(function (r) {
+      if (r.status === 202) {
+        return r.json().then(function (data) {
+          suSay("updating to " + (data.tag || "a newer release") + "; reloading shortly", false);
+          // The handover briefly drops every connection, so this waits out
+          // the restart rather than reloading into a closed port.
+          setTimeout(function () { location.reload(); }, 8000);
+        });
+      }
+      if (r.status === 200) { suSay("already up to date", false); suBtn.disabled = false; return; }
+      return r.text().then(function (t) { suSay("failed (" + r.status + "): " + t, true); suBtn.disabled = false; });
+    }).catch(function (e) { suSay("failed: " + e, true); suBtn.disabled = false; });
+  });
   var box = document.getElementById("new-session");
   var repo = document.getElementById("ns-repo");
   var filter = document.getElementById("ns-filter");

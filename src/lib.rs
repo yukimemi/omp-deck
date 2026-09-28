@@ -11,6 +11,7 @@ pub mod omp;
 pub mod repos;
 pub mod server;
 pub mod sessions;
+pub mod update;
 pub mod view;
 
 /// Current wall-clock time as unix milliseconds.
