@@ -349,8 +349,19 @@ fn watch(mut cmd: std::process::Command) -> Result<(), OmpError> {
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            // Still running: `omp` itself (non-Windows) is up.
-            Ok(None) => return Ok(()),
+            // Still running: `omp` itself (non-Windows) is up. Nothing here
+            // ever calls `wait` on it again, and on Unix an un-waited child
+            // that later exits sits as a zombie — still visible to `kill -0`
+            // — until something reaps it. `stop` polls exactly that signal
+            // to tell a killed process has actually gone, so a background
+            // thread blocked on `wait` is what makes that polling ever see
+            // "gone" once the process exits on its own.
+            Ok(None) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Ok(());
+            }
             Err(e) => return Err(OmpError::Spawn(e.to_string())),
         }
     }
@@ -395,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn stop_kills_a_running_process_and_is_idempotent() {
         let omp = RealOmp::default();
-        let mut child = if cfg!(windows) {
+        let child = if cfg!(windows) {
             std::process::Command::new("cmd")
                 .args(["/c", "ping -n 31 127.0.0.1 >NUL"])
                 .spawn()
@@ -404,15 +415,39 @@ mod tests {
         }
         .unwrap();
         let pid = child.id();
+        // `stop` now waits for the pid to actually disappear, which on Unix
+        // needs *something* to reap it once it exits, same as a spawned
+        // `omp` needs `watch`'s own reaper thread. Here that's this thread,
+        // standing in for whatever normally owns the process (this test's
+        // direct child is unusual; a real target is typically reaped by its
+        // own unrelated parent, not by omp-deck).
+        let reaper = std::thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        });
         assert!(omp.stop(pid).await.is_ok());
-        for _ in 0..20 {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        assert!(matches!(child.try_wait(), Ok(Some(_))), "still running");
+        reaper.join().unwrap();
         // Stopping an already-gone pid is still Ok: idempotent.
         assert!(omp.stop(pid).await.is_ok());
+    }
+
+    // No Windows equivalent of an unkillable-by-terminate process is set up
+    // here; taskkill's own `/F` already forces termination, so the timeout
+    // branch there is unreached in practice, unlike SIGTERM on Unix.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn stop_502s_as_a_timeout_when_the_process_ignores_sigterm() {
+        let omp = RealOmp::default();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; sleep 30"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(matches!(omp.stop(pid).await, Err(OmpError::Timeout)));
+        // Clean up: the process ignored SIGTERM, so SIGKILL it directly.
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .output();
+        let _ = child.wait();
     }
 }

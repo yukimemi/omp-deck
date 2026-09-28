@@ -261,7 +261,12 @@ mod tests {
 
         let mut no_pid = hosts.clone();
         no_pid[0].pid = None;
-        assert_eq!(render_page(&no_pid, NOW).matches("class=\"resume\"").count(), 1);
+        assert_eq!(
+            render_page(&no_pid, NOW)
+                .matches("class=\"resume\"")
+                .count(),
+            1
+        );
 
         let mut no_session = hosts;
         no_session[0].session_id = String::new();

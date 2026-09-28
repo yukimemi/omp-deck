@@ -523,7 +523,9 @@ mod tests {
         assert_eq!(
             *omp.resumes.lock(),
             vec![(
-                std::path::PathBuf::from("C:\\Users\\yukimemi\\src\\github.com\\yukimemi\\omp-deck"),
+                std::path::PathBuf::from(
+                    "C:\\Users\\yukimemi\\src\\github.com\\yukimemi\\omp-deck"
+                ),
                 "sess-1".to_string()
             )]
         );
@@ -541,11 +543,11 @@ mod tests {
     #[tokio::test]
     async fn resume_502s_without_calling_stop_when_the_host_is_missing_pid_cwd_or_session_id() {
         for (mutate, hint) in [
+            ((|h: &mut Host| h.pid = None) as fn(&mut Host), "pid"),
             (
-                (|h: &mut Host| h.pid = None) as fn(&mut Host),
-                "pid",
+                (|h: &mut Host| h.cwd = String::new()) as fn(&mut Host),
+                "cwd",
             ),
-            ((|h: &mut Host| h.cwd = String::new()) as fn(&mut Host), "cwd"),
             (
                 (|h: &mut Host| h.session_id = String::new()) as fn(&mut Host),
                 "session id",

@@ -106,9 +106,12 @@ Every card also has a **close** button. It calls
 session (`taskkill /PID <pid> /T /F` on Windows, `kill -TERM <pid>`
 elsewhere) — omp has no remote "stop" command, so this ends the process
 directly, for any live session, not only ones started from this dashboard.
-It answers `202` right away; an unknown instance id is `404`, and a session
-omp did not report a pid for, or a failed kill, is `502` with the error.
-The button asks for confirmation first: there is no undo.
+It then waits (up to 5s) for the pid to actually disappear before answering,
+so that a resume chained onto the same kill (below) never races a fresh
+process over the pid it just freed. An unknown instance id is `404`; a
+session omp did not report a pid for, a failed kill, or a kill whose target
+is still alive after that 5s wait, is `502` with the error; otherwise it
+answers `202`. The button asks for confirmation first: there is no undo.
 
 Cards with both a pid and a session id also get a **resume** button, for a
 session whose host process is still listed but whose relay link has gone
@@ -116,17 +119,18 @@ stale (a common symptom of a relay drop that outlasted omp's own reconnect
 window: `omp collab list` still shows it as live, but any link generated for
 it points at a room already ended on the relay side). It calls
 `POST /api/sessions/<instanceId>/resume`, which looks the id up the same way,
-kills the pid exactly as the close button does — waiting up to 5s for the
-process to actually exit before continuing — and then starts a fresh
-`omp --cwd <cwd> --resume=<sessionId>` detached, using the cwd and session id
-`omp collab list` reported for it. `omp` restores the session's own saved
-model on resume, so none is passed. It answers `202` right away; the same
-`404`/`502` cases as close apply before anything is touched, and if the kill
-itself fails (including timing out) nothing is started and the response is
-`502`. If the kill succeeds but the relaunch fails, the response is still
-`502`, with a message noting the old process is already stopped. The button
-asks for confirmation first, same as close, since it kills a running process
-before restarting it — and because a resumed session gets a new instance id,
+kills the pid exactly as the close button does — including that same up to
+5s wait for the process to actually exit before continuing — and then starts
+a fresh `omp --cwd <cwd> --resume=<sessionId>` detached, using the cwd and
+session id `omp collab list` reported for it. `omp` restores the session's
+own saved model on resume, so none is passed. It answers `202` right away;
+the same `404`/`502` cases as close apply before anything is touched, and if
+the kill itself fails (including timing out) nothing is started and the
+response is `502`. If the kill succeeds but the relaunch fails, the response
+is still `502`, with a message noting the old process is already stopped.
+The button asks for confirmation first, same as close, since it kills a
+running process before restarting it — and because a resumed session gets a
+new instance id,
 the dashboard needs a reload to show it (the page does this automatically).
 
 ### How omp is launched
