@@ -439,10 +439,24 @@ mod tests {
     async fn stop_502s_as_a_timeout_when_the_process_ignores_sigterm() {
         let omp = RealOmp::default();
         let mut child = std::process::Command::new("sh")
-            .args(["-c", "trap '' TERM; sleep 30"])
+            // Prints once the trap is actually installed, so the test never
+            // races the shell's own startup: without this, `stop` can send
+            // SIGTERM before `trap` has run, in which case it kills the
+            // shell normally and the test observes `Ok` instead of the
+            // timeout it means to exercise.
+            .args(["-c", "trap '' TERM; echo ready; sleep 30"])
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let pid = child.id();
+        {
+            use std::io::{BufRead, BufReader};
+            let mut line = String::new();
+            BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line.trim(), "ready");
+        }
         assert!(matches!(omp.stop(pid).await, Err(OmpError::Timeout)));
         // Clean up: the process ignored SIGTERM, so SIGKILL it directly.
         let _ = std::process::Command::new("kill")
