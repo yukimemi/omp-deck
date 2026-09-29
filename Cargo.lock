@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "omp-deck"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "async-trait",
