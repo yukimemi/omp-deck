@@ -1273,6 +1273,7 @@ dependencies = [
  "clap",
  "dirs",
  "kaishin",
+ "libc",
  "parking_lot",
  "reqwest 0.12.28",
  "serde",

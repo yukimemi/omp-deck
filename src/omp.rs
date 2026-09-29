@@ -220,21 +220,131 @@ fn spawn_detached(exe: &Path, args: &[String]) -> Result<(), OmpError> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    watch(cmd)
+    watch(cmd, ExitSource::Piped)
 }
 
-/// Elsewhere: best effort, own process group, no terminal. Untested against a
-/// real omp; if it needs a tty there, it dies within `START_WATCH` and 502s.
+/// Elsewhere: `omp` is a TUI and exits immediately (SIGHUP-style, code 129)
+/// when its stdio is `/dev/null` instead of a tty, the same failure the
+/// Windows path avoids by handing it a fresh console. Here that means
+/// allocating a pseudo-terminal and giving `omp` the slave side as its
+/// stdin/stdout/stderr; `setsid` in the child both makes it a session leader
+/// (replacing the `process_group(0)` this used before setsid existed here —
+/// the two do not compose: setsid already makes the child a new process
+/// group leader, and `process_group(0)` on top of that can fail with EPERM)
+/// and, via `TIOCSCTTY`, is what lets that pty become its controlling
+/// terminal. The master half stays open in this process, drained by a
+/// background thread so the pty's buffer never fills up and blocks `omp`;
+/// its last few KB are kept to fill in `OmpError::Exit`'s otherwise-empty
+/// stderr when `omp` dies within `START_WATCH`.
+///
+/// Known limitation: the master fd lives in this process, not in a
+/// separate long-lived host the way `cmd /c start` outlives this process on
+/// Windows. A self-update restart of omp-deck itself closes every live
+/// session's master half and, with it, SIGHUPs that session's `omp`. Fixing
+/// that needs a detached pty-holding process (e.g. a re-exec'd helper); out
+/// of scope here.
 #[cfg(not(windows))]
 fn spawn_detached(exe: &Path, args: &[String]) -> Result<(), OmpError> {
     use std::os::unix::process::CommandExt;
+
+    let pty = pty::open().map_err(|e| OmpError::Spawn(e.to_string()))?;
+    let [stdin, stdout, stderr] = pty
+        .dup_slave_stdio()
+        .map_err(|e| OmpError::Spawn(e.to_string()))?;
+
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(args)
-        .process_group(0)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    watch(cmd)
+    cmd.args(args).stdin(stdin).stdout(stdout).stderr(stderr);
+    // SAFETY: `setsid` and `ioctl` are both async-signal-safe and are the
+    // only calls made between `fork` and `exec` in the child.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(0, pty::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    watch(cmd, ExitSource::Pty(pty.master))
+}
+
+/// A minimal `openpty(3)` wrapper: allocate a pty, hand the child the slave
+/// side, keep the master side here to drain and to detect the pty closing.
+#[cfg(not(windows))]
+mod pty {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    #[cfg(target_os = "macos")]
+    pub const TIOCSCTTY: libc::c_ulong = 0x2000_7461;
+    #[cfg(target_os = "linux")]
+    pub const TIOCSCTTY: libc::c_ulong = 0x540E;
+
+    pub struct Pty {
+        pub master: OwnedFd,
+        slave: OwnedFd,
+    }
+
+    /// Allocate a pty. `openpty` is a libc extension (not POSIX) but is
+    /// present on both Linux (glibc/musl) and macOS.
+    pub fn open() -> std::io::Result<Pty> {
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        // SAFETY: `openpty` fully initializes both out-params on success;
+        // null is accepted for the name/termios/winsize out-params we don't
+        // need.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `openpty` just returned these as freshly opened, uniquely
+        // owned fds.
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        set_cloexec(&master)?;
+        Ok(Pty { master, slave })
+    }
+
+    impl Pty {
+        /// Three independent duplicates of the slave fd, one per stdio
+        /// stream, so each can be handed to `Command` and closed
+        /// independently of the others and of `self.slave`.
+        pub fn dup_slave_stdio(&self) -> std::io::Result<[std::process::Stdio; 3]> {
+            Ok([
+                dup_stdio(&self.slave)?,
+                dup_stdio(&self.slave)?,
+                dup_stdio(&self.slave)?,
+            ])
+        }
+    }
+
+    fn dup_stdio(fd: &OwnedFd) -> std::io::Result<std::process::Stdio> {
+        // SAFETY: `dup` on a valid, open fd returns either -1 or a new,
+        // uniquely owned fd.
+        let d = unsafe { libc::dup(fd.as_raw_fd()) };
+        if d < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(d) }.into())
+    }
+
+    fn set_cloexec(fd: &OwnedFd) -> std::io::Result<()> {
+        // SAFETY: `fd` is a valid, open fd for the duration of this call.
+        let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        if rc == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 /// Windows: `taskkill /T` also takes down `omp`'s own child processes (e.g.
@@ -323,7 +433,18 @@ fn wait_pid_gone(pid: u32) -> Result<(), OmpError> {
 }
 
 /// Spawn and report a failure that happens within `START_WATCH`.
-fn watch(mut cmd: std::process::Command) -> Result<(), OmpError> {
+#[cfg_attr(not(windows), allow(dead_code))]
+enum ExitSource {
+    /// Windows: read `child.stderr` once, on failure, the way `Command`
+    /// already buffers it.
+    Piped,
+    /// Elsewhere: continuously drain the pty master in a background thread
+    /// so it never blocks `omp`, and use its tail as the failure's stderr.
+    #[cfg(not(windows))]
+    Pty(std::os::fd::OwnedFd),
+}
+
+fn watch(mut cmd: std::process::Command, exit_source: ExitSource) -> Result<(), OmpError> {
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             OmpError::NotFound(e.to_string())
@@ -331,19 +452,33 @@ fn watch(mut cmd: std::process::Command) -> Result<(), OmpError> {
             OmpError::Spawn(e.to_string())
         }
     })?;
+    #[cfg(not(windows))]
+    let captured = match exit_source {
+        ExitSource::Piped => None,
+        ExitSource::Pty(master) => Some(spawn_pty_reader(master)),
+    };
     let deadline = std::time::Instant::now() + START_WATCH;
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(status)) => {
-                let mut stderr = String::new();
-                if let Some(mut pipe) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = pipe.read_to_string(&mut stderr);
-                }
+                #[cfg(not(windows))]
+                let stderr = match &captured {
+                    Some(captured) => {
+                        let buf = captured.lock().unwrap_or_else(|e| e.into_inner());
+                        String::from_utf8_lossy(&buf)
+                            .trim()
+                            .chars()
+                            .take(500)
+                            .collect()
+                    }
+                    None => read_child_stderr(&mut child),
+                };
+                #[cfg(windows)]
+                let stderr = read_child_stderr(&mut child);
                 return Err(OmpError::Exit {
                     code: status.code(),
-                    stderr: stderr.trim().chars().take(500).collect(),
+                    stderr,
                 });
             }
             Ok(None) if std::time::Instant::now() < deadline => {
@@ -365,6 +500,50 @@ fn watch(mut cmd: std::process::Command) -> Result<(), OmpError> {
             Err(e) => return Err(OmpError::Spawn(e.to_string())),
         }
     }
+}
+
+/// Windows-only fallback: read `child`'s piped stderr once it has exited.
+fn read_child_stderr(child: &mut std::process::Child) -> String {
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read;
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    stderr.trim().chars().take(500).collect()
+}
+
+/// Continuously drain a pty master in the background so it never fills up
+/// and blocks the child attached to its slave side; keep the last few KB so
+/// a caller can use them as an `OmpError::Exit`'s stderr. Runs until the
+/// master read errors or returns EOF, which on Unix happens once every
+/// slave fd (held only by the child here) has closed.
+#[cfg(not(windows))]
+fn spawn_pty_reader(master: std::os::fd::OwnedFd) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+    use std::io::Read;
+    const TAIL: usize = 8192;
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let buf2 = std::sync::Arc::clone(&buf);
+    std::thread::spawn(move || {
+        let mut file = std::fs::File::from(master);
+        let mut chunk = [0u8; 4096];
+        loop {
+            match file.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut b = buf2.lock().unwrap_or_else(|e| e.into_inner());
+                    b.extend_from_slice(&chunk[..n]);
+                    let len = b.len();
+                    if len > TAIL {
+                        b.drain(0..len - TAIL);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                // Most commonly EIO once the last slave fd closes.
+                Err(_) => break,
+            }
+        }
+    });
+    buf
 }
 
 #[cfg(test)]
@@ -463,5 +642,67 @@ mod tests {
             .args(["-KILL", &pid.to_string()])
             .output();
         let _ = child.wait();
+    }
+
+    /// Writes `body` as an executable `sh` script to a fresh temp file and
+    /// returns its path, kept alive for as long as the returned `TempPath`
+    /// is (spawn_detached only needs the path, not an open handle).
+    #[cfg(not(windows))]
+    fn shell_script(body: &str) -> tempfile::TempPath {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "#!/bin/sh\n{body}").unwrap();
+        f.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        f.into_temp_path()
+    }
+
+    // Regression test for the bug this pty support fixes: `omp` is a TUI
+    // that used to be spawned with all of stdin/stdout/stderr set to
+    // `/dev/null`, so it saw no tty and exited immediately (code 129,
+    // reported as a 502 with empty stderr). `spawn_detached` must instead
+    // give it a real tty on stdin and stdout.
+    #[cfg(not(windows))]
+    #[test]
+    fn spawn_detached_gives_the_child_a_real_tty() {
+        let script = shell_script("[ -t 0 ] && [ -t 1 ] && exec sleep 5\nexit 42");
+        // Still running after `START_WATCH` (it's inside `sleep 5`) counts
+        // as success; dying with 42 would mean it saw no tty.
+        assert!(spawn_detached(&script, &[]).is_ok());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn spawn_detached_reports_exit_code_and_output_on_early_failure() {
+        let script = shell_script("echo boom\nexit 3");
+        match spawn_detached(&script, &[]) {
+            Err(OmpError::Exit { code, stderr }) => {
+                assert_eq!(code, Some(3));
+                assert!(stderr.contains("boom"), "{stderr:?}");
+            }
+            other => panic!("expected Exit{{code: 3, ..}}, got {other:?}"),
+        }
+    }
+
+    // Before the pty's master was drained in a background thread, a chatty
+    // child could fill the pty's buffer and block forever on write, which
+    // would make this hang instead of observing the child's own exit.
+    #[cfg(not(windows))]
+    #[test]
+    fn spawn_detached_drains_large_output_without_hanging() {
+        let script = shell_script("yes | head -c 200000\nexit 7");
+        let start = std::time::Instant::now();
+        let result = spawn_detached(&script, &[]);
+        assert!(
+            start.elapsed() < START_WATCH,
+            "spawn_detached took {:?}, likely blocked on a full pty buffer",
+            start.elapsed()
+        );
+        assert!(
+            matches!(result, Err(OmpError::Exit { code: Some(7), .. })),
+            "{result:?}"
+        );
     }
 }
