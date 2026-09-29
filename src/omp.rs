@@ -311,6 +311,7 @@ mod pty {
         let master = unsafe { OwnedFd::from_raw_fd(master) };
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
         set_cloexec(&master)?;
+        set_cloexec(&slave)?;
         Ok(Pty { master, slave })
     }
 
@@ -328,13 +329,22 @@ mod pty {
     }
 
     fn dup_stdio(fd: &OwnedFd) -> std::io::Result<std::process::Stdio> {
-        // SAFETY: `dup` on a valid, open fd returns either -1 or a new,
-        // uniquely owned fd.
-        let d = unsafe { libc::dup(fd.as_raw_fd()) };
+        Ok(dup_cloexec(fd)?.into())
+    }
+
+    /// Duplicate `fd` with close-on-exec set. Plain `dup` would drop the
+    /// flag, and these duplicates stay open in the parent until `Command`
+    /// is dropped, so an unrelated child spawned meanwhile would inherit
+    /// the tty. std's `dup2` onto 0/1/2 in the omp child clears the flag,
+    /// so omp still gets its stdio.
+    fn dup_cloexec(fd: &OwnedFd) -> std::io::Result<OwnedFd> {
+        // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` on a valid, open fd returns
+        // either -1 or a new, uniquely owned fd.
+        let d = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if d < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(unsafe { OwnedFd::from_raw_fd(d) }.into())
+        Ok(unsafe { OwnedFd::from_raw_fd(d) })
     }
 
     fn set_cloexec(fd: &OwnedFd) -> std::io::Result<()> {
@@ -344,6 +354,24 @@ mod pty {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn is_cloexec(fd: &OwnedFd) -> bool {
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            flags != -1 && flags & libc::FD_CLOEXEC != 0
+        }
+
+        #[test]
+        fn slave_and_its_duplicates_are_close_on_exec() {
+            let pty = open().unwrap();
+            assert!(is_cloexec(&pty.master));
+            assert!(is_cloexec(&pty.slave));
+            assert!(is_cloexec(&dup_cloexec(&pty.slave).unwrap()));
+        }
     }
 }
 
@@ -675,6 +703,16 @@ mod tests {
         let script = shell_script("[ -t 0 ] && [ -t 1 ] && exec sleep 5\nexit 42");
         // Still running after `START_WATCH` (it's inside `sleep 5`) counts
         // as success; dying with 42 would mean it saw no tty.
+        assert!(spawn_detached(&script, &[]).is_ok());
+    }
+
+    // The pty slave must not leak into unrelated children: it is
+    // close-on-exec, and only dup2'd onto 0/1/2 for omp itself.
+    #[cfg(not(windows))]
+    #[test]
+    fn spawn_detached_does_not_leak_the_slave_past_stdio() {
+        let script =
+            shell_script("for fd in 3 4 5 6 7 8 9; do [ -t $fd ] && exit 42; done\nexec sleep 5");
         assert!(spawn_detached(&script, &[]).is_ok());
     }
 
