@@ -108,7 +108,7 @@ fn cwd_matches(repo_path: &Path, record_cwd: &str) -> bool {
 }
 
 /// Resumable sessions for `repo_path`, newest first: every `.jsonl` file
-/// belonging to it that has no live `.<name>.jsonl.lock.os` lock next to it,
+/// belonging to it that has no held `.<name>.jsonl.lock.os` lock next to it,
 /// whose filename-derived id and recorded `cwd` both match. A missing or
 /// unreadable directory, or a file this module cannot parse, contributes
 /// nothing rather than failing the whole list.
@@ -144,6 +144,29 @@ pub fn list(sessions_root: &Path, home: Option<&Path>, repo_path: &Path) -> Vec<
     out
 }
 
+/// Whether a live process holds the OS advisory lock `omp` takes on a
+/// session (`.<name>.jsonl.lock.os`). The file's mere existence proves nothing:
+/// `omp` leaves the 0-byte file behind when a process dies, so liveness is
+/// decided by trying a non-blocking exclusive lock (flock / `LockFileEx`,
+/// assuming `omp` uses the same lock family). Acquiring it means nobody holds
+/// it; it is released at once and the file is never modified or removed.
+///
+/// A missing lock file is not held. Any other failure to open or lock it
+/// errs on the side of "held" so a possibly-live session is never resumed.
+fn lock_is_held(lock: &Path) -> bool {
+    let file = match std::fs::File::open(lock) {
+        Ok(f) => f,
+        Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 /// Appends every resumable, cross-checked session in one project directory
 /// to `out`. A missing/unreadable directory contributes nothing.
 fn collect_dir(dir: &Path, repo_path: &Path, out: &mut Vec<SessionEntry>) {
@@ -165,7 +188,7 @@ fn collect_dir(dir: &Path, repo_path: &Path, out: &mut Vec<SessionEntry>) {
         let Some((_, filename_id)) = stem.split_once('_') else {
             continue;
         };
-        if dir.join(format!(".{name}.lock.os")).exists() {
+        if lock_is_held(&dir.join(format!(".{name}.lock.os"))) {
             continue; // A live process still owns this session.
         }
         let Ok(metadata) = entry.metadata() else {
@@ -262,6 +285,44 @@ mod tests {
         assert_eq!(entries[0].session_id, "outside");
     }
 
+    /// Creates the 0-byte lock file and holds the OS lock on it for as long
+    /// as the returned handle lives, like a running `omp` would.
+    fn hold_lock(path: &Path) -> std::fs::File {
+        std::fs::write(path, "").unwrap();
+        let f = std::fs::File::open(path).unwrap();
+        f.try_lock().unwrap();
+        f
+    }
+
+    #[test]
+    fn a_stale_lock_file_nobody_holds_keeps_the_session_listed() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let repo = home.join("src").join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        let root = t.path().join("sessions");
+        let dir = root.join("-src-proj");
+        write_session(
+            &dir,
+            "2026-01-01T00-00-00-000Z_stale.jsonl",
+            Some("Stale"),
+            "stale",
+            &repo,
+            1,
+        );
+        let lock = dir.join(".2026-01-01T00-00-00-000Z_stale.jsonl.lock.os");
+        std::fs::write(&lock, "").unwrap();
+        let entries = list(&root, Some(&home), &repo);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, "stale");
+        assert!(lock.exists(), "the lock file must be left alone");
+        // Once held, the same session disappears; released, it returns.
+        let held = hold_lock(&lock);
+        assert!(list(&root, Some(&home), &repo).is_empty());
+        drop(held);
+        assert_eq!(list(&root, Some(&home), &repo).len(), 1);
+    }
+
     #[test]
     fn scanning_every_project_directory_still_excludes_locked_and_mismatched() {
         let t = tempfile::tempdir().unwrap();
@@ -279,11 +340,7 @@ mod tests {
             &repo,
             1,
         );
-        std::fs::write(
-            dir.join(".2026-01-01T00-00-00-000Z_locked.jsonl.lock.os"),
-            "",
-        )
-        .unwrap();
+        let _held = hold_lock(&dir.join(".2026-01-01T00-00-00-000Z_locked.jsonl.lock.os"));
         let other = t.path().join("elsewhere").join("other");
         std::fs::create_dir_all(&other).unwrap();
         write_session(
@@ -332,11 +389,7 @@ mod tests {
             &repo,
             1,
         );
-        std::fs::write(
-            dir.join(".2026-01-03T00-00-00-000Z_locked.jsonl.lock.os"),
-            "",
-        )
-        .unwrap();
+        let _held = hold_lock(&dir.join(".2026-01-03T00-00-00-000Z_locked.jsonl.lock.os"));
         // Belongs to a different checkout under the same sanitized dir name.
         let other = home.join("other");
         std::fs::create_dir_all(&other).unwrap();
