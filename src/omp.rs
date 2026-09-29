@@ -362,6 +362,28 @@ mod pty {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn has_cloexec(fd: &OwnedFd) -> bool {
+            // SAFETY: `fd` is a valid, open fd for the duration of this call.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0, "F_GETFD failed");
+            flags & libc::FD_CLOEXEC != 0
+        }
+
+        /// A freshly opened pty must not leak either end into unrelated
+        /// children exec'd later; only the `dup_slave_stdio` copies (which
+        /// `Command` dup2s onto 0/1/2) are meant to reach `omp`.
+        #[test]
+        fn open_marks_master_and_slave_cloexec() {
+            let pty = open().expect("openpty");
+            assert!(has_cloexec(&pty.master), "master lacks FD_CLOEXEC");
+            assert!(has_cloexec(&pty.slave), "slave lacks FD_CLOEXEC");
+        }
+    }
 }
 
 /// Windows: `taskkill /T` also takes down `omp`'s own child processes (e.g.
