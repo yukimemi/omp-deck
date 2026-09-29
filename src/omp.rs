@@ -73,6 +73,11 @@ pub trait Omp: Send + Sync {
 /// How long `start` watches the launcher for an immediate failure.
 const START_WATCH: Duration = Duration::from_secs(2);
 
+/// How long `watch` waits, after a failed exit, for the pty reader to reach
+/// EOF and hand over the child's final output.
+#[cfg(not(windows))]
+const PTY_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
 /// How long `stop` waits for a killed pid to actually disappear.
 const STOP_WAIT: Duration = Duration::from_secs(5);
 
@@ -267,7 +272,9 @@ fn spawn_detached(exe: &Path, args: &[String]) -> Result<(), OmpError> {
             Ok(())
         });
     }
-    watch(cmd, ExitSource::Pty(pty.master))
+    // Close our own slave now: while the parent holds one, the master never
+    // reaches EOF, so the reader could not signal that it has drained.
+    watch(cmd, ExitSource::Pty(pty.into_master()))
 }
 
 /// A minimal `openpty(3)` wrapper: allocate a pty, hand the child the slave
@@ -311,10 +318,17 @@ mod pty {
         let master = unsafe { OwnedFd::from_raw_fd(master) };
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
         set_cloexec(&master)?;
+        set_cloexec(&slave)?;
         Ok(Pty { master, slave })
     }
 
     impl Pty {
+        /// Consume the pty, closing the parent's slave fd and keeping the
+        /// master.
+        pub fn into_master(self) -> OwnedFd {
+            self.master
+        }
+
         /// Three independent duplicates of the slave fd, one per stdio
         /// stream, so each can be handed to `Command` and closed
         /// independently of the others and of `self.slave`.
@@ -328,9 +342,12 @@ mod pty {
     }
 
     fn dup_stdio(fd: &OwnedFd) -> std::io::Result<std::process::Stdio> {
-        // SAFETY: `dup` on a valid, open fd returns either -1 or a new,
-        // uniquely owned fd.
-        let d = unsafe { libc::dup(fd.as_raw_fd()) };
+        // Close-on-exec so the copy cannot leak into unrelated children
+        // spawned concurrently (which would keep the master from hitting
+        // EOF); `Command` dup2s it onto 0/1/2 in the child, clearing the flag.
+        // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` on a valid, open fd returns
+        // either -1 or a new, uniquely owned fd.
+        let d = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if d < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -452,6 +469,9 @@ fn watch(mut cmd: std::process::Command, exit_source: ExitSource) -> Result<(), 
             OmpError::Spawn(e.to_string())
         }
     })?;
+    // Drop the `Command` so the stdio fds it holds are closed in this
+    // process; otherwise a pty master never sees EOF.
+    drop(cmd);
     // On Windows, `ExitSource::Piped` is the only variant, so this just
     // consumes the parameter (it would otherwise go unused on that
     // platform, since the `match` right below it is unix-only).
@@ -469,7 +489,11 @@ fn watch(mut cmd: std::process::Command, exit_source: ExitSource) -> Result<(), 
             Ok(Some(status)) => {
                 #[cfg(not(windows))]
                 let stderr = match &captured {
-                    Some(captured) => {
+                    Some((captured, done)) => {
+                        // The child has exited, but the reader thread may
+                        // not have drained the master yet; wait for its EOF
+                        // so the tail is complete.
+                        let _ = done.recv_timeout(PTY_DRAIN_GRACE);
                         let buf = captured.lock().unwrap_or_else(|e| e.into_inner());
                         String::from_utf8_lossy(&buf)
                             .trim()
@@ -523,11 +547,17 @@ fn read_child_stderr(child: &mut std::process::Child) -> String {
 /// master read errors or returns EOF, which on Unix happens once every
 /// slave fd (held only by the child here) has closed.
 #[cfg(not(windows))]
-fn spawn_pty_reader(master: std::os::fd::OwnedFd) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+fn spawn_pty_reader(
+    master: std::os::fd::OwnedFd,
+) -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    std::sync::mpsc::Receiver<()>,
+) {
     use std::io::Read;
     const TAIL: usize = 8192;
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let buf2 = std::sync::Arc::clone(&buf);
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut file = std::fs::File::from(master);
         let mut chunk = [0u8; 4096];
@@ -547,8 +577,9 @@ fn spawn_pty_reader(master: std::os::fd::OwnedFd) -> std::sync::Arc<std::sync::M
                 Err(_) => break,
             }
         }
+        let _ = tx.send(());
     });
-    buf
+    (buf, rx)
 }
 
 #[cfg(test)]
