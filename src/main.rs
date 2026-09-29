@@ -45,6 +45,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Internal: own the pty of one omp session (spawned by `serve`)
+    #[command(hide = true)]
+    PtyHost {
+        /// The omp executable followed by its arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
+        argv: Vec<String>,
+    },
     /// Check for and install a newer omp-deck release
     SelfUpdate {
         /// Install without prompting
@@ -56,9 +63,21 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let cli = Cli::parse();
+    // The pty host must not start a runtime, the update check or anything
+    // else the server does: it is a tiny process that outlives the server.
+    if let Command::PtyHost { argv } = cli.command {
+        return omp_deck::omp::run_pty_host(argv);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(run(cli))
+}
+
+async fn run(cli: Cli) -> ExitCode {
     // Skip the background check for `self-update` itself: it already does
     // its own explicit check, and the two would race the same GitHub call.
     let auto_update = if matches!(cli.command, Command::SelfUpdate { .. }) {
@@ -75,6 +94,7 @@ async fn main() -> ExitCode {
         } => serve(omp, omp_path, bind, discord_webhook, cli.config).await,
         Command::List { json } => list(&omp, json).await,
         Command::SelfUpdate { yes, check } => update::run_self_update(yes, check).await,
+        Command::PtyHost { .. } => unreachable!("handled before the runtime starts"),
     };
     if let Some(handle) = auto_update {
         update::finalize_auto_update_check(handle).await;
