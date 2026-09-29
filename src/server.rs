@@ -267,8 +267,8 @@ async fn api_repo_sessions_resume(
     let Some(root) = &l.sessions_root else {
         return plain(StatusCode::NOT_FOUND, "no resumable session with that id");
     };
-    // Re-scan rather than trust anything cached: a session that picked up a
-    // lock file (or vanished) between listing and resuming must not be resumed.
+    // Re-scan rather than trust anything cached: a session whose lock got
+    // held (or that vanished) between listing and resuming must not be resumed.
     let entries = sessions::list(root, l.home.as_deref(), std::path::Path::new(&repo.path));
     if !entries.iter().any(|e| e.session_id == req.session_id) {
         return plain(StatusCode::NOT_FOUND, "no resumable session with that id");
@@ -1034,7 +1034,7 @@ mod tests {
 
     /// A ghq-layout checkout under a tempdir "home", plus a sessions root
     /// holding two resumable sessions and one still-locked (live) one.
-    fn sessions_layout() -> (tempfile::TempDir, Arc<Launcher>, String) {
+    fn sessions_layout() -> (tempfile::TempDir, Arc<Launcher>, String, std::fs::File) {
         let t = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(t.path().join("h/o/r/.git")).unwrap();
         let home = t.path().canonicalize().unwrap();
@@ -1066,18 +1066,33 @@ mod tests {
             repo_path,
             1,
         );
+        // Held for as long as the caller keeps the returned handle, like a
+        // running omp; a bare leftover file would count as stale.
+        let lock_path = dir.join(".2026-01-03T00-00-00-000Z_locked.jsonl.lock.os");
+        std::fs::write(&lock_path, "").unwrap();
+        let held = std::fs::File::open(&lock_path).unwrap();
+        held.try_lock().unwrap();
+        // A leftover lock file nobody holds must not hide its session.
+        write_session_fixture(
+            &dir,
+            "2026-01-04T00-00-00-000Z_stale.jsonl",
+            "Stale lock session",
+            "stale",
+            repo_path,
+            5,
+        );
         std::fs::write(
-            dir.join(".2026-01-03T00-00-00-000Z_locked.jsonl.lock.os"),
+            dir.join(".2026-01-04T00-00-00-000Z_stale.jsonl.lock.os"),
             "",
         )
         .unwrap();
         let l = launcher_with_sessions(vec![t.path().to_path_buf()], sessions_root, home);
-        (t, l, path)
+        (t, l, path, held)
     }
 
     #[tokio::test]
     async fn repo_sessions_lists_resumable_sessions_excluding_locked_ones() {
-        let (_t, l, path) = sessions_layout();
+        let (_t, l, path, _lock) = sessions_layout();
         let omp = fixture();
         let (status, _, body) = {
             let app = router(omp.clone(), l.clone());
@@ -1101,13 +1116,13 @@ mod tests {
             .iter()
             .map(|s| s["sessionId"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, vec!["newer", "older"]);
-        assert_eq!(v["sessions"][0]["title"], "Newer session");
+        assert_eq!(ids, vec!["stale", "newer", "older"]);
+        assert_eq!(v["sessions"][1]["title"], "Newer session");
     }
 
     #[tokio::test]
     async fn repo_sessions_rejects_unknown_checkout_paths() {
-        let (_t, l, _path) = sessions_layout();
+        let (_t, l, _path, _lock) = sessions_layout();
         let omp = fixture();
         let (status, _) = call(
             router(omp.clone(), l.clone()),
@@ -1152,7 +1167,7 @@ mod tests {
 
     #[tokio::test]
     async fn resume_session_starts_the_named_past_session_without_stopping_anything() {
-        let (_t, l, path) = sessions_layout();
+        let (_t, l, path, _lock) = sessions_layout();
         let omp = fixture();
         let (status, body) = post_resume_session(&omp, &l, &path, "newer").await;
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -1165,8 +1180,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_session_accepts_a_session_with_only_a_stale_lock_file() {
+        let (_t, l, path, _lock) = sessions_layout();
+        let omp = fixture();
+        let (status, _) = post_resume_session(&omp, &l, &path, "stale").await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(omp.resumes.lock().len(), 1);
+    }
+
+    #[tokio::test]
     async fn resume_session_rejects_an_id_the_rescan_does_not_list() {
-        let (_t, l, path) = sessions_layout();
+        let (_t, l, path, _lock) = sessions_layout();
         let omp = fixture();
         for bad in ["locked", "unknown-id", "../escape"] {
             let (status, _) = post_resume_session(&omp, &l, &path, bad).await;
@@ -1177,7 +1201,7 @@ mod tests {
 
     #[tokio::test]
     async fn resume_session_rejects_unknown_checkout_paths_without_calling_resume() {
-        let (_t, l, _path) = sessions_layout();
+        let (_t, l, _path, _lock) = sessions_layout();
         let omp = fixture();
         let (status, _) = post_resume_session(&omp, &l, "/nowhere", "newer").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
