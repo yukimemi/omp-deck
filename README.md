@@ -160,9 +160,19 @@ PTY/ConPTY dependency is needed. Trade-offs:
 - Arguments go through `cmd.exe`: each is quoted, and a path or model that
   contains `"`, `%`, `!`, a control character or a trailing backslash is
   refused. With `omp.cmd` instead of `omp.exe` there is one more wrapper.
-- Non-Windows: omp is spawned directly in its own process group with no
-  terminal. This is untested; if omp needs a tty there it exits at once and
-  you get a `502`.
+- Non-Windows: omp gets a pseudo-terminal as its controlling terminal. The
+  pty master is owned by a small per-session helper (this binary re-exec'd as
+  the hidden `omp-deck pty-host` subcommand, in its own session), not by the
+  server, so sessions survive the server exiting, crashing or self-updating.
+  The helper lives until its omp exits. This covers the omp-deck process
+  only: a supervisor that kills the whole cgroup (systemd
+  `KillMode=control-group`, the default) still takes the helpers down, so use
+  `KillMode=process` for the unit, and killing a helper itself ends its
+  session. Sessions started by an omp-deck older than this change hold their
+  pty in the server and cannot be handed over: stop them before updating from
+  such a version. The helper's argument shape and status line stay
+  backward compatible, since an old server may launch a new binary's helper
+  between a self-update install and the restart.
 
 ## Security
 

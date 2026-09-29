@@ -104,11 +104,19 @@ pub fn parse_link(json: &str) -> Result<String, serde_json::Error> {
 #[derive(Debug, Clone, Default)]
 pub struct RealOmp {
     explicit: Option<PathBuf>,
+    /// This binary's own path, captured at construction (a self-update
+    /// replaces it on disk while we keep running, which on Linux turns a
+    /// later `current_exe()` into a `(deleted)` path). Re-exec'd as the
+    /// detached pty host that owns each spawned `omp`'s terminal.
+    host: Option<PathBuf>,
 }
 
 impl RealOmp {
     pub fn new(explicit: Option<PathBuf>) -> Self {
-        Self { explicit }
+        Self {
+            explicit,
+            host: std::env::current_exe().ok(),
+        }
     }
 
     /// Explicit path first, then PATH lookup preferring `omp.exe` over `omp.cmd`.
@@ -169,12 +177,13 @@ impl Omp for RealOmp {
 
     async fn start(&self, cwd: &Path, model: Option<&str>) -> Result<(), OmpError> {
         let exe = self.resolve()?;
+        let host = self.host.clone();
         let mut args = vec!["--cwd".to_string(), cwd.display().to_string()];
         if let Some(model) = model {
             args.push("--model".into());
             args.push(model.to_string());
         }
-        tokio::task::spawn_blocking(move || spawn_detached(&exe, &args))
+        tokio::task::spawn_blocking(move || spawn_detached(host.as_deref(), &exe, &args))
             .await
             .map_err(|e| OmpError::Spawn(e.to_string()))?
     }
@@ -187,12 +196,13 @@ impl Omp for RealOmp {
 
     async fn resume(&self, cwd: &Path, session_id: &str) -> Result<(), OmpError> {
         let exe = self.resolve()?;
+        let host = self.host.clone();
         let args = vec![
             "--cwd".to_string(),
             cwd.display().to_string(),
             format!("--resume={session_id}"),
         ];
-        tokio::task::spawn_blocking(move || spawn_detached(&exe, &args))
+        tokio::task::spawn_blocking(move || spawn_detached(host.as_deref(), &exe, &args))
             .await
             .map_err(|e| OmpError::Spawn(e.to_string()))?
     }
@@ -205,7 +215,7 @@ impl Omp for RealOmp {
 /// starts outlives both `cmd` and this server. Every argument is wrapped in
 /// quotes by hand, and the few characters that cannot survive `cmd` are refused.
 #[cfg(windows)]
-fn spawn_detached(exe: &Path, args: &[String]) -> Result<(), OmpError> {
+fn spawn_detached(_host: Option<&Path>, exe: &Path, args: &[String]) -> Result<(), OmpError> {
     use std::os::windows::process::CommandExt;
     let exe = exe.display().to_string();
     if std::iter::once(&exe).chain(args).any(|a| unsafe_for_cmd(a)) {
@@ -225,31 +235,160 @@ fn spawn_detached(exe: &Path, args: &[String]) -> Result<(), OmpError> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    watch(cmd, ExitSource::Piped)
+    reap_in_background(watch(cmd, ExitSource::Piped)?);
+    Ok(())
 }
 
 /// Elsewhere: `omp` is a TUI and exits immediately (SIGHUP-style, code 129)
 /// when its stdio is `/dev/null` instead of a tty, the same failure the
-/// Windows path avoids by handing it a fresh console. Here that means
-/// allocating a pseudo-terminal and giving `omp` the slave side as its
-/// stdin/stdout/stderr; `setsid` in the child both makes it a session leader
-/// (replacing the `process_group(0)` this used before setsid existed here —
-/// the two do not compose: setsid already makes the child a new process
-/// group leader, and `process_group(0)` on top of that can fail with EPERM)
-/// and, via `TIOCSCTTY`, is what lets that pty become its controlling
-/// terminal. The master half stays open in this process, drained by a
-/// background thread so the pty's buffer never fills up and blocks `omp`;
-/// its last few KB are kept to fill in `OmpError::Exit`'s otherwise-empty
-/// stderr when `omp` dies within `START_WATCH`.
+/// Windows path avoids by handing it a fresh console. So it needs a
+/// pseudo-terminal, and the pty master must outlive this server: closing the
+/// master hangs up the controlling terminal of whatever runs on the slave,
+/// which would kill every live session whenever the server restarts (a
+/// self-update, a crash, a manual restart).
 ///
-/// Known limitation: the master fd lives in this process, not in a
-/// separate long-lived host the way `cmd /c start` outlives this process on
-/// Windows. A self-update restart of omp-deck itself closes every live
-/// session's master half and, with it, SIGHUPs that session's `omp`. Fixing
-/// that needs a detached pty-holding process (e.g. a re-exec'd helper); out
-/// of scope here.
+/// The master is therefore owned by a small per-session helper: this very
+/// binary re-exec'd as the hidden `pty-host` subcommand (see [`pty_host`]),
+/// in its own session so it is unaffected by this server's terminal or exit.
+/// The helper opens the pty, starts `omp` on it, drains the master, reports
+/// the start-up outcome as one JSON line on its stdout, and then lives until
+/// `omp` exits. The server needs nothing from the pty afterwards: `stop` and
+/// `link` work from `omp`'s pid and `omp collab`.
+///
+/// The argument shape of `pty-host` and the status line are a compatibility
+/// surface: between a self-update installing the new binary and the server
+/// restarting, the old server launches the new binary's helper.
 #[cfg(not(windows))]
-fn spawn_detached(exe: &Path, args: &[String]) -> Result<(), OmpError> {
+fn spawn_detached(host: Option<&Path>, exe: &Path, args: &[String]) -> Result<(), OmpError> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+
+    let host =
+        host.ok_or_else(|| OmpError::Spawn("cannot resolve the omp-deck executable".to_string()))?;
+    let mut cmd = std::process::Command::new(host);
+    cmd.arg("pty-host")
+        .arg("--")
+        .arg(exe)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: `setsid` is async-signal-safe and the only call made between
+    // `fork` and `exec` in the child.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut helper = cmd
+        .spawn()
+        .map_err(|e| OmpError::Spawn(format!("cannot start pty host {}: {e}", host.display())))?;
+    let mut stdout = helper.stdout.take();
+    // Reap the helper when it exits (with `omp`), or it lingers as a zombie.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = Vec::new();
+        if let Some(out) = stdout.as_mut() {
+            let _ = out.take(STATUS_MAX).read_to_end(&mut line);
+        }
+        let _ = tx.send(line);
+        let _ = helper.wait();
+    });
+    let line = rx
+        .recv_timeout(START_WATCH + STATUS_GRACE)
+        .map_err(|_| OmpError::Timeout)?;
+    parse_host_status(&line)
+}
+
+/// Upper bound on the helper's status line.
+#[cfg(not(windows))]
+const STATUS_MAX: u64 = 16 * 1024;
+/// Slack on top of [`START_WATCH`] for the helper to start and answer.
+#[cfg(not(windows))]
+const STATUS_GRACE: Duration = Duration::from_secs(8);
+
+/// The helper's one-line start-up report. Unknown fields are ignored.
+#[cfg(not(windows))]
+#[derive(Debug, Default, Deserialize, serde::Serialize)]
+struct HostStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ok: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stderr: Option<String>,
+    /// `"not_found"` or `"spawn"`: the helper could not start `omp` at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[cfg(not(windows))]
+fn host_status_for<T>(result: &Result<T, OmpError>) -> HostStatus {
+    match result {
+        Ok(_) => HostStatus {
+            ok: Some(true),
+            ..Default::default()
+        },
+        Err(OmpError::Exit { code, stderr }) => HostStatus {
+            code: *code,
+            stderr: Some(stderr.clone()),
+            ..Default::default()
+        },
+        Err(OmpError::NotFound(m)) => HostStatus {
+            error: Some("not_found".into()),
+            message: Some(m.clone()),
+            ..Default::default()
+        },
+        Err(OmpError::Spawn(m)) => HostStatus {
+            error: Some("spawn".into()),
+            message: Some(m.clone()),
+            ..Default::default()
+        },
+        Err(e) => HostStatus {
+            error: Some("spawn".into()),
+            message: Some(e.to_string()),
+            ..Default::default()
+        },
+    }
+}
+
+#[cfg(not(windows))]
+fn parse_host_status(raw: &[u8]) -> Result<(), OmpError> {
+    let text = String::from_utf8_lossy(raw);
+    let Some(line) = text.lines().find(|l| !l.trim().is_empty()) else {
+        return Err(OmpError::Spawn(
+            "pty host exited without reporting a status".into(),
+        ));
+    };
+    let st: HostStatus = serde_json::from_str(line)
+        .map_err(|e| OmpError::Spawn(format!("unreadable pty host status: {e}")))?;
+    let message = st.message.unwrap_or_default();
+    match st.error.as_deref() {
+        Some("not_found") => Err(OmpError::NotFound(message)),
+        Some(_) => Err(OmpError::Spawn(message)),
+        None if st.ok == Some(true) => Ok(()),
+        None if st.code.is_some() || st.stderr.is_some() => Err(OmpError::Exit {
+            code: st.code,
+            stderr: st.stderr.unwrap_or_default(),
+        }),
+        None => Err(OmpError::Spawn("unrecognised pty host status".into())),
+    }
+}
+
+/// Allocate a pty and start `exe` on it as a session leader with the pty as
+/// its controlling terminal, then watch it for [`START_WATCH`]. `Ok(Some)` is
+/// the still-running `omp`; the caller owns waiting for it. The master half
+/// is drained by a background thread so the pty's buffer never fills up and
+/// blocks `omp`; its last few KB fill in `OmpError::Exit`'s stderr when `omp`
+/// dies early. `setsid` in the child makes it a session leader and, via
+/// `TIOCSCTTY`, makes the pty its controlling terminal.
+#[cfg(not(windows))]
+fn start_on_pty(exe: &Path, args: &[String]) -> Result<Option<std::process::Child>, OmpError> {
     use std::os::unix::process::CommandExt;
 
     let pty = pty::open().map_err(|e| OmpError::Spawn(e.to_string()))?;
@@ -272,9 +411,24 @@ fn spawn_detached(exe: &Path, args: &[String]) -> Result<(), OmpError> {
             Ok(())
         });
     }
-    // Close our own slave now: while the parent holds one, the master never
-    // reaches EOF, so the reader could not signal that it has drained.
+    // Close our own slave now: while we hold one, the master never reaches
+    // EOF, so the reader could not signal that it has drained.
     watch(cmd, ExitSource::Pty(pty.into_master()))
+}
+
+#[cfg(not(windows))]
+mod pty_host;
+
+/// Entry point of the hidden `pty-host` subcommand.
+#[cfg(not(windows))]
+pub fn run_pty_host(argv: Vec<String>) -> std::process::ExitCode {
+    pty_host::run(argv)
+}
+
+#[cfg(windows)]
+pub fn run_pty_host(_argv: Vec<String>) -> std::process::ExitCode {
+    eprintln!("omp-deck: pty-host is not used on Windows");
+    std::process::ExitCode::FAILURE
 }
 
 /// A minimal `openpty(3)` wrapper: allocate a pty, hand the child the slave
@@ -483,7 +637,12 @@ enum ExitSource {
     Pty(std::os::fd::OwnedFd),
 }
 
-fn watch(mut cmd: std::process::Command, exit_source: ExitSource) -> Result<(), OmpError> {
+/// `Ok(None)`: it already exited successfully. `Ok(Some)`: still running
+/// after the window; the caller decides how to wait for it.
+fn watch(
+    mut cmd: std::process::Command,
+    exit_source: ExitSource,
+) -> Result<Option<std::process::Child>, OmpError> {
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             OmpError::NotFound(e.to_string())
@@ -507,7 +666,7 @@ fn watch(mut cmd: std::process::Command, exit_source: ExitSource) -> Result<(), 
     let deadline = std::time::Instant::now() + START_WATCH;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) if status.success() => return Ok(None),
             Ok(Some(status)) => {
                 #[cfg(not(windows))]
                 let stderr = match &captured {
@@ -535,21 +694,21 @@ fn watch(mut cmd: std::process::Command, exit_source: ExitSource) -> Result<(), 
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            // Still running: `omp` itself (non-Windows) is up. Nothing here
-            // ever calls `wait` on it again, and on Unix an un-waited child
-            // that later exits sits as a zombie — still visible to `kill -0`
-            // — until something reaps it. `stop` polls exactly that signal
-            // to tell a killed process has actually gone, so a background
-            // thread blocked on `wait` is what makes that polling ever see
-            // "gone" once the process exits on its own.
-            Ok(None) => {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
-                return Ok(());
-            }
+            Ok(None) => return Ok(Some(child)),
             Err(e) => return Err(OmpError::Spawn(e.to_string())),
         }
+    }
+}
+
+/// On Unix an un-waited child that exits sits as a zombie, still visible to
+/// `kill -0`, until something reaps it; `stop` polls exactly that signal, so
+/// a background thread blocked on `wait` is what lets it see "gone".
+#[cfg(windows)]
+fn reap_in_background(child: Option<std::process::Child>) {
+    if let Some(mut child) = child {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
     }
 }
 
@@ -717,25 +876,60 @@ mod tests {
         f.into_temp_path()
     }
 
-    // Regression test for the bug this pty support fixes: `omp` is a TUI
-    // that used to be spawned with all of stdin/stdout/stderr set to
-    // `/dev/null`, so it saw no tty and exited immediately (code 129,
-    // reported as a 502 with empty stderr). `spawn_detached` must instead
-    // give it a real tty on stdin and stdout.
+    /// The in-process half of the pty host (what the helper runs).
     #[cfg(not(windows))]
-    #[test]
-    fn spawn_detached_gives_the_child_a_real_tty() {
-        let script = shell_script("[ -t 0 ] && [ -t 1 ] && exec sleep 5\nexit 42");
-        // Still running after `START_WATCH` (it's inside `sleep 5`) counts
-        // as success; dying with 42 would mean it saw no tty.
-        assert!(spawn_detached(&script, &[]).is_ok());
+    fn start_in_process(script: &Path) -> Result<(), OmpError> {
+        start_on_pty(script, &[]).map(|child| {
+            if let Some(mut child) = child {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+        })
     }
 
     #[cfg(not(windows))]
     #[test]
-    fn spawn_detached_reports_exit_code_and_output_on_early_failure() {
+    fn host_status_round_trips_through_the_wire_format() {
+        let cases = [
+            Ok(()),
+            Err(OmpError::Exit {
+                code: Some(3),
+                stderr: "boom".into(),
+            }),
+            Err(OmpError::NotFound("nope".into())),
+            Err(OmpError::Spawn("bad".into())),
+        ];
+        for case in cases {
+            let line = serde_json::to_vec(&host_status_for(&case)).unwrap();
+            assert_eq!(
+                format!("{:?}", parse_host_status(&line)),
+                format!("{case:?}")
+            );
+        }
+        assert!(matches!(parse_host_status(b""), Err(OmpError::Spawn(_))));
+        assert!(parse_host_status(br#"{"ok":true,"future":1}"#).is_ok());
+    }
+
+    // Regression test for the bug this pty support fixes: `omp` is a TUI
+    // that used to be spawned with all of stdin/stdout/stderr set to
+    // `/dev/null`, so it saw no tty and exited immediately (code 129,
+    // reported as a 502 with empty stderr). `start_on_pty` must instead
+    // give it a real tty on stdin and stdout.
+    #[cfg(not(windows))]
+    #[test]
+    fn start_on_pty_gives_the_child_a_real_tty() {
+        let script = shell_script("[ -t 0 ] && [ -t 1 ] && exec sleep 5\nexit 42");
+        // Still running after `START_WATCH` (it's inside `sleep 5`) counts
+        // as success; dying with 42 would mean it saw no tty.
+        assert!(start_in_process(&script).is_ok());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn start_on_pty_reports_exit_code_and_output_on_early_failure() {
         let script = shell_script("echo boom\nexit 3");
-        match spawn_detached(&script, &[]) {
+        match start_in_process(&script) {
             Err(OmpError::Exit { code, stderr }) => {
                 assert_eq!(code, Some(3));
                 assert!(stderr.contains("boom"), "{stderr:?}");
@@ -749,13 +943,13 @@ mod tests {
     // would make this hang instead of observing the child's own exit.
     #[cfg(not(windows))]
     #[test]
-    fn spawn_detached_drains_large_output_without_hanging() {
+    fn start_on_pty_drains_large_output_without_hanging() {
         let script = shell_script("yes | head -c 200000\nexit 7");
         let start = std::time::Instant::now();
-        let result = spawn_detached(&script, &[]);
+        let result = start_in_process(&script);
         assert!(
             start.elapsed() < START_WATCH,
-            "spawn_detached took {:?}, likely blocked on a full pty buffer",
+            "start_on_pty took {:?}, likely blocked on a full pty buffer",
             start.elapsed()
         );
         assert!(
