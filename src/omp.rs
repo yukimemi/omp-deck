@@ -452,6 +452,11 @@ fn watch(mut cmd: std::process::Command, exit_source: ExitSource) -> Result<(), 
             OmpError::Spawn(e.to_string())
         }
     })?;
+    // On Windows, `ExitSource::Piped` is the only variant, so this just
+    // consumes the parameter (it would otherwise go unused on that
+    // platform, since the `match` right below it is unix-only).
+    #[cfg(windows)]
+    let ExitSource::Piped = exit_source;
     #[cfg(not(windows))]
     let captured = match exit_source {
         ExitSource::Piped => None,
