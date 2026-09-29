@@ -221,7 +221,7 @@ mod tests {
         let path = dir.join(filename);
         std::fs::write(&path, body).unwrap();
         let mtime = SystemTime::now() - Duration::from_secs(age_secs);
-        let file = std::fs::File::open(&path).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
         file.set_modified(mtime).unwrap();
     }
 

@@ -1024,7 +1024,9 @@ mod tests {
         let path = dir.join(filename);
         std::fs::write(&path, body).unwrap();
         let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
-        std::fs::File::open(&path)
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_modified(mtime)
             .unwrap();
