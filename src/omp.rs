@@ -879,7 +879,20 @@ mod tests {
     /// The in-process half of the pty host (what the helper runs).
     #[cfg(not(windows))]
     fn start_in_process(script: &Path) -> Result<(), OmpError> {
-        start_on_pty(script, &[]).map(|child| {
+        // Tests run in parallel threads: another test's fork can briefly hold
+        // a copy of this script's just-closed write fd, making exec fail with
+        // ETXTBSY ("Text file busy") until that child execs. Retry that alone.
+        let mut attempts = 0;
+        let started = loop {
+            match start_on_pty(script, &[]) {
+                Err(OmpError::Spawn(msg)) if msg.contains("Text file busy") && attempts < 50 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                other => break other,
+            }
+        };
+        started.map(|child| {
             if let Some(mut child) = child {
                 std::thread::spawn(move || {
                     let _ = child.wait();
