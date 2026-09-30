@@ -938,6 +938,26 @@ mod tests {
         }
     }
 
+    // The reader thread may still hold the tail of the output when the child
+    // exits; the report must wait for it. Repeated to make the race likely.
+    // Total output stays under the 500 chars the report keeps.
+    #[cfg(not(windows))]
+    #[test]
+    fn start_on_pty_reports_the_full_output_of_an_early_exit() {
+        let script = shell_script(
+            "i=1\nwhile [ $i -le 20 ]; do echo l$i; i=$((i+1)); done\necho LAST-MARKER\nexit 3",
+        );
+        for _ in 0..10 {
+            match start_in_process(&script) {
+                Err(OmpError::Exit { code, stderr }) => {
+                    assert_eq!(code, Some(3));
+                    assert!(stderr.contains("LAST-MARKER"), "{stderr:?}");
+                }
+                other => panic!("expected Exit{{code: 3, ..}}, got {other:?}"),
+            }
+        }
+    }
+
     // Before the pty's master was drained in a background thread, a chatty
     // child could fill the pty's buffer and block forever on write, which
     // would make this hang instead of observing the child's own exit.
