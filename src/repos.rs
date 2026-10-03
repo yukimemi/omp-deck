@@ -20,6 +20,9 @@ pub struct Repo {
     /// the picker and matched against on submit, so both sides use this one
     /// representation (Windows verbatim prefix stripped).
     pub path: String,
+    /// Directory name of the host level (`github.com`); internal, not serialized.
+    #[serde(skip)]
+    pub host: String,
 }
 
 pub fn scan(roots: &[PathBuf]) -> Vec<Repo> {
@@ -29,7 +32,8 @@ pub fn scan(roots: &[PathBuf]) -> Vec<Repo> {
         for host in subdirs(root) {
             for owner in subdirs(&host) {
                 for dir in subdirs(&owner) {
-                    if !dir.join(".git").exists() {
+                    // In-flight clone scratch space is never a checkout.
+                    if file_name(&dir).contains(".omp-deck-clone-") || !dir.join(".git").exists() {
                         continue;
                     }
                     let path = dir.canonicalize().unwrap_or_else(|_| dir.clone());
@@ -39,6 +43,7 @@ pub fn scan(roots: &[PathBuf]) -> Vec<Repo> {
                     out.push(Repo {
                         name: format!("{}/{}", file_name(&owner), file_name(&dir)),
                         path: display_path(&path),
+                        host: file_name(&host),
                     });
                 }
             }
@@ -50,7 +55,7 @@ pub fn scan(roots: &[PathBuf]) -> Vec<Repo> {
 
 /// Canonical path as text, without the `\\?\` verbatim prefix Windows adds
 /// (omp shows and compares plain `C:\...` paths).
-fn display_path(path: &Path) -> String {
+pub(crate) fn display_path(path: &Path) -> String {
     let s = path.display().to_string();
     match s.strip_prefix(r"\\?\") {
         Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_string(),
@@ -92,6 +97,15 @@ impl Cache {
         }
     }
 
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    /// Forgets the cached scan, so a fresh clone shows up at once.
+    pub fn invalidate(&self) {
+        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
     pub fn has_roots(&self) -> bool {
         !self.roots.is_empty()
     }
@@ -131,6 +145,7 @@ mod tests {
         let a = checkout(t.path(), "github.com/acme/a");
         std::fs::create_dir_all(t.path().join("github.com/acme/not-a-repo")).unwrap();
         std::fs::create_dir_all(t.path().join("github.com/too-shallow/.git")).unwrap();
+        checkout(t.path(), "github.com/acme/.b.omp-deck-clone-1-0");
         let repos = scan(&[t.path().to_path_buf()]);
         let names: Vec<_> = repos.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["acme/a", "zed/b"]);

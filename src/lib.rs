@@ -8,6 +8,7 @@ pub mod config;
 pub mod model;
 pub mod notify;
 pub mod omp;
+pub mod remote;
 pub mod repos;
 pub mod server;
 pub mod sessions;

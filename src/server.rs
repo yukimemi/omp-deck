@@ -3,6 +3,7 @@
 
 use crate::model::Host;
 use crate::omp::{Access, Omp, OmpError};
+use crate::remote;
 use crate::repos;
 use crate::sessions;
 use crate::update::{RealUpdater, SelfUpdater};
@@ -28,6 +29,8 @@ type Shared = Arc<dyn Omp>;
 /// outside these is ever handed to `omp`.
 pub struct Launcher {
     pub repos: repos::Cache,
+    /// GitHub repositories not checked out locally, and the clone flow.
+    pub remote: remote::Remote,
     pub models: Vec<String>,
     /// Root of `omp`'s own session log (`<dir>/sessions`), `None` if it could
     /// not be resolved -- then no repo ever has past sessions to offer.
@@ -96,6 +99,10 @@ pub fn router_with_updater(
         })
 }
 
+/// How long the picker waits for the first `gh` listing before showing local
+/// checkouts alone.
+const FIRST_LISTING_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 const NO_ROOTS_HINT: &str = "No repository roots configured. Add [repos] roots = [\"...\"] to      the omp-deck config file (see the README).";
 
 impl FromRef<AppState> for Arc<Launcher> {
@@ -105,9 +112,20 @@ impl FromRef<AppState> for Arc<Launcher> {
 }
 
 async fn api_repos(State(l): State<Arc<Launcher>>) -> Response {
-    let repos = l.repos.get().await;
+    let local = l.repos.get().await;
+    // Remote candidates are only useful (cloneable) when a root is configured.
+    // `pending`: the first listing is still running, so the page should ask again.
+    let (remote, pending) = if l.repos.has_roots() {
+        match l.remote.get_within(FIRST_LISTING_WAIT).await {
+            Some(names) => (names, false),
+            None => (Default::default(), true),
+        }
+    } else {
+        (Default::default(), false)
+    };
+    let repos = remote::merge(&local, &remote);
     let hint = (!l.repos.has_roots()).then_some(NO_ROOTS_HINT);
-    Json(json!({ "repos": *repos, "hint": hint })).into_response()
+    Json(json!({ "repos": repos, "hint": hint, "pending": pending })).into_response()
 }
 
 async fn api_models(State(l): State<Arc<Launcher>>) -> Response {
@@ -117,7 +135,12 @@ async fn api_models(State(l): State<Arc<Launcher>>) -> Response {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StartRequest {
-    path: String,
+    /// A checkout the scan listed. Exclusive with `remote`.
+    #[serde(default)]
+    path: Option<String>,
+    /// `owner/repo` of a remote-only GitHub repository to clone first.
+    #[serde(default)]
+    remote: Option<String>,
     #[serde(default)]
     model: Option<String>,
 }
@@ -127,12 +150,9 @@ async fn api_start(
     State(l): State<Arc<Launcher>>,
     Json(req): Json<StartRequest>,
 ) -> Response {
-    // Only ever start omp in a checkout the scan itself just listed, with a
-    // model the config names; the values passed on are ours, not the request's.
-    let repos = l.repos.get().await;
-    let Some(repo) = repos.iter().find(|r| r.path == req.path) else {
-        return plain(StatusCode::NOT_FOUND, "not a known checkout");
-    };
+    // Only ever start omp in a checkout the scan itself just listed (or one
+    // cloned from a repository gh just listed), with a model the config names;
+    // the values passed on are ours, not the request's.
     let model = match req.model.as_deref() {
         None | Some("") => None,
         Some(m) => match l.models.iter().find(|c| c.as_str() == m) {
@@ -140,7 +160,43 @@ async fn api_start(
             None => return plain(StatusCode::BAD_REQUEST, "not a configured model"),
         },
     };
-    match omp.start(std::path::Path::new(&repo.path), model).await {
+    let cwd = match (req.path, req.remote) {
+        (Some(path), None) => {
+            let repos = l.repos.get().await;
+            let Some(repo) = repos.iter().find(|r| r.path == path) else {
+                return plain(StatusCode::NOT_FOUND, "not a known checkout");
+            };
+            repo.path.clone()
+        }
+        (None, Some(name)) => {
+            if remote::split_name(&name).is_none() {
+                return plain(StatusCode::BAD_REQUEST, "invalid repository name");
+            }
+            if !l.remote.get().await.contains(&name) {
+                return plain(StatusCode::NOT_FOUND, "not a known remote repository");
+            }
+            if !l.repos.has_roots() {
+                return plain(StatusCode::BAD_REQUEST, NO_ROOTS_HINT);
+            }
+            match l
+                .remote
+                .ensure_checkout(l.repos.roots(), &name, &l.repos)
+                .await
+            {
+                Ok(path) => path,
+                Err(e) => {
+                    return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response();
+                }
+            }
+        }
+        _ => {
+            return plain(
+                StatusCode::BAD_REQUEST,
+                "give exactly one of path and remote",
+            );
+        }
+    };
+    match omp.start(std::path::Path::new(&cwd), model).await {
         Ok(()) => (StatusCode::ACCEPTED, Json(json!({ "started": true }))).into_response(),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
@@ -570,9 +626,19 @@ mod tests {
         }
     }
 
+    fn remote_of(gh: Arc<remote::fake::FakeGitHub>) -> remote::Remote {
+        let d = std::time::Duration::from_secs(60);
+        remote::Remote::new(gh, d, d)
+    }
+
+    fn no_remote() -> remote::Remote {
+        remote_of(remote::fake::FakeGitHub::new(Err("no gh".into())))
+    }
+
     fn launcher(roots: Vec<std::path::PathBuf>, models: &[&str]) -> Arc<Launcher> {
         Arc::new(Launcher {
             repos: repos::Cache::new(roots, std::time::Duration::from_secs(30)),
+            remote: no_remote(),
             models: models.iter().map(|m| m.to_string()).collect(),
             sessions_root: None,
             home: None,
@@ -588,6 +654,7 @@ mod tests {
     ) -> Arc<Launcher> {
         Arc::new(Launcher {
             repos: repos::Cache::new(roots, std::time::Duration::from_secs(30)),
+            remote: no_remote(),
             models: Vec::new(),
             sessions_root: Some(sessions_root),
             home: Some(home),
@@ -953,6 +1020,96 @@ mod tests {
         ] {
             let (status, _) = post_session(&omp, &l, json!({ "path": bad })).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{bad:?}");
+        }
+        assert!(omp.starts.lock().is_empty());
+    }
+
+    fn remote_launcher(root: &std::path::Path, gh: Arc<remote::fake::FakeGitHub>) -> Arc<Launcher> {
+        Arc::new(Launcher {
+            repos: repos::Cache::new(vec![root.to_path_buf()], std::time::Duration::from_secs(30)),
+            remote: remote_of(gh),
+            models: Vec::new(),
+            sessions_root: None,
+            home: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn repos_lists_remote_only_entries_once_and_marks_them() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(t.path().join("github.com/o/r/.git")).unwrap();
+        let gh = remote::fake::FakeGitHub::new(Ok(vec!["O/R".into(), "o/new".into()]));
+        let l = remote_launcher(t.path(), gh);
+        let res = call(
+            router(FakeOmp::new(Ok(Vec::new())), l),
+            Request::get("/api/repos").body(Body::empty()).unwrap(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&res.1).unwrap();
+        assert_eq!(v["repos"][0]["name"], "o/new");
+        assert_eq!(v["repos"][0]["remote"], true);
+        assert_eq!(v["repos"][0]["path"], "");
+        assert_eq!(v["repos"][1]["name"], "o/r");
+        assert_eq!(v["repos"][1]["remote"], false);
+        assert_eq!(v["repos"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn remote_start_clones_then_starts_in_the_ghq_path() {
+        let t = tempfile::tempdir().unwrap();
+        let gh = remote::fake::FakeGitHub::new(Ok(vec!["acme/tool".into()]));
+        let l = remote_launcher(t.path(), gh.clone());
+        let omp = FakeOmp::new(Ok(Vec::new()));
+        let (status, body) = post_session(&omp, &l, json!({ "remote": "acme/tool" })).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let want = std::path::PathBuf::from(repos::display_path(
+            &t.path()
+                .join("github.com/acme/tool")
+                .canonicalize()
+                .unwrap(),
+        ));
+        assert_eq!(gh.clones.lock().unwrap().len(), 1);
+        assert_eq!(*omp.starts.lock(), vec![(want, None)]);
+    }
+
+    #[tokio::test]
+    async fn remote_start_of_an_unknown_repo_is_404_without_cloning() {
+        let t = tempfile::tempdir().unwrap();
+        let gh = remote::fake::FakeGitHub::new(Ok(vec!["acme/tool".into()]));
+        let l = remote_launcher(t.path(), gh.clone());
+        let omp = FakeOmp::new(Ok(Vec::new()));
+        let (status, _) = post_session(&omp, &l, json!({ "remote": "acme/other" })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = post_session(&omp, &l, json!({ "remote": "../x/y" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(gh.clones.lock().unwrap().is_empty());
+        assert!(omp.starts.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_clone_failure_is_502_and_starts_nothing() {
+        let t = tempfile::tempdir().unwrap();
+        let gh = Arc::new(remote::fake::FakeGitHub {
+            clone_error: Some("permission denied".into()),
+            ..Arc::try_unwrap(remote::fake::FakeGitHub::new(Ok(vec!["acme/tool".into()])))
+                .ok()
+                .unwrap()
+        });
+        let l = remote_launcher(t.path(), gh);
+        let omp = FakeOmp::new(Ok(Vec::new()));
+        let (status, body) = post_session(&omp, &l, json!({ "remote": "acme/tool" })).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.contains("permission denied"), "{body}");
+        assert!(omp.starts.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_needs_exactly_one_of_path_and_remote() {
+        let (_t, l, path) = one_checkout();
+        let omp = FakeOmp::new(Ok(Vec::new()));
+        for body in [json!({}), json!({ "path": path, "remote": "o/r" })] {
+            let (status, _) = post_session(&omp, &l, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
         }
         assert!(omp.starts.lock().is_empty());
     }

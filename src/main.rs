@@ -11,6 +11,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 const REPO_SCAN_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const REMOTE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+const REMOTE_FAIL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Parser)]
 #[command(
@@ -134,6 +136,11 @@ async fn serve(
     let config = Config::load_or_default(config_path.as_deref()).map_err(|e| format!("{e:#}"))?;
     let launcher = Arc::new(Launcher {
         repos: repos::Cache::new(config.repos.roots, REPO_SCAN_TTL),
+        remote: omp_deck::remote::Remote::new(
+            Arc::new(omp_deck::remote::RealGitHub),
+            REMOTE_TTL,
+            REMOTE_FAIL_TTL,
+        ),
         models: config.models.list,
         sessions_root: omp_deck::sessions::default_root(),
         home: dirs::home_dir(),
