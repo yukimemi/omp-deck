@@ -83,6 +83,7 @@ pub fn router_with_updater(
             "/api/repos/{path}/sessions/resume",
             post(api_repo_sessions_resume),
         )
+        .route("/api/update", get(api_update))
         .route("/api/self-update", post(api_self_update))
         .route("/go/{instance_id}/{kind}", get(go))
         .layer(middleware::map_response(harden))
@@ -298,6 +299,22 @@ async fn api_repo_sessions_resume(
 /// actually dropped, and only then does `main.rs` spawn the successor and
 /// let this process exit. Spawning the successor any earlier would race it
 /// against this process for the port.
+async fn api_update(State(state): State<AppState>) -> Response {
+    if state.updater.disabled() {
+        return Json(json!({ "available": false })).into_response();
+    }
+    match state.updater.known_update().await {
+        Ok(Some(latest)) => Json(json!({ "available": true, "to": latest.tag_name })),
+        Ok(None) => Json(json!({ "available": false })),
+        // Unknown is not available: a failed check hides the button.
+        Err(e) => {
+            eprintln!("omp-deck: update check failed: {e}");
+            Json(json!({ "available": false }))
+        }
+    }
+    .into_response()
+}
+
 async fn api_self_update(State(state): State<AppState>) -> Response {
     if state.updater.disabled() {
         return plain(
@@ -507,6 +524,8 @@ mod tests {
         disabled: bool,
         newer: Result<Option<LatestRelease>, String>,
         install_result: Result<(), String>,
+        known: Result<Option<LatestRelease>, String>,
+        known_calls: Mutex<u32>,
         newer_calls: Mutex<u32>,
         installs: Mutex<u32>,
     }
@@ -515,7 +534,9 @@ mod tests {
         fn new(disabled: bool, newer: Result<Option<LatestRelease>, String>) -> Arc<Self> {
             Arc::new(Self {
                 disabled,
+                known: newer.clone(),
                 newer,
+                known_calls: Mutex::new(0),
                 install_result: Ok(()),
                 newer_calls: Mutex::new(0),
                 installs: Mutex::new(0),
@@ -531,6 +552,10 @@ mod tests {
         async fn newer_release(&self) -> Result<Option<LatestRelease>, String> {
             *self.newer_calls.lock() += 1;
             self.newer.clone()
+        }
+        async fn known_update(&self) -> Result<Option<LatestRelease>, String> {
+            *self.known_calls.lock() += 1;
+            self.known.clone()
         }
         async fn install(&self) -> Result<(), String> {
             *self.installs.lock() += 1;
@@ -1288,5 +1313,63 @@ mod tests {
         let (status2, _) = post_self_update(app).await;
         assert_eq!(status2, StatusCode::CONFLICT);
         assert_eq!(*updater.newer_calls.lock(), 1);
+    }
+
+    async fn get_update(app: Router) -> (StatusCode, String) {
+        let res = app
+            .oneshot(Request::get("/api/update").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let (parts, body) = res.into_parts();
+        let bytes = to_bytes(body, usize::MAX).await.unwrap();
+        (parts.status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    async fn update_json(
+        updater: &Arc<FakeUpdater>,
+    ) -> (StatusCode, serde_json::Value, watch::Receiver<bool>) {
+        let (tx, rx) = watch::channel(false);
+        let app = router_with_updater(fixture(), launcher(Vec::new(), &[]), updater.clone(), tx);
+        let (status, body) = get_update(app).await;
+        (status, serde_json::from_str(&body).unwrap(), rx)
+    }
+
+    #[tokio::test]
+    async fn update_reports_a_newer_release() {
+        let updater = FakeUpdater::new(false, Ok(Some(release("v9.9.9"))));
+        let (status, v, rx) = update_json(&updater).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v, json!({ "available": true, "to": "v9.9.9" }));
+        // A GET never installs or restarts.
+        assert_eq!(*updater.installs.lock(), 0);
+        assert!(!*rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn update_reports_unavailable_when_up_to_date() {
+        let updater = FakeUpdater::new(false, Ok(None));
+        let (status, v, _rx) = update_json(&updater).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v, json!({ "available": false }));
+        assert_eq!(*updater.known_calls.lock(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_reports_unavailable_when_disabled_without_checking() {
+        let updater = FakeUpdater::new(true, Ok(Some(release("v9.9.9"))));
+        let (status, v, _rx) = update_json(&updater).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v, json!({ "available": false }));
+        assert_eq!(*updater.known_calls.lock(), 0);
+        assert_eq!(*updater.newer_calls.lock(), 0);
+    }
+
+    #[tokio::test]
+    async fn update_reports_unavailable_when_the_check_fails() {
+        let updater = FakeUpdater::new(false, Err("github is down".to_string()));
+        let (status, v, _rx) = update_json(&updater).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v, json!({ "available": false }));
+        assert_eq!(*updater.installs.lock(), 0);
     }
 }
