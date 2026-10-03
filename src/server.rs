@@ -99,6 +99,10 @@ pub fn router_with_updater(
         })
 }
 
+/// How long the picker waits for the first `gh` listing before showing local
+/// checkouts alone.
+const FIRST_LISTING_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 const NO_ROOTS_HINT: &str = "No repository roots configured. Add [repos] roots = [\"...\"] to      the omp-deck config file (see the README).";
 
 impl FromRef<AppState> for Arc<Launcher> {
@@ -111,7 +115,7 @@ async fn api_repos(State(l): State<Arc<Launcher>>) -> Response {
     let local = l.repos.get().await;
     // Remote candidates are only useful (cloneable) when a root is configured.
     let remote = if l.repos.has_roots() {
-        l.remote.get().await
+        l.remote.get_within(FIRST_LISTING_WAIT).await
     } else {
         Default::default()
     };

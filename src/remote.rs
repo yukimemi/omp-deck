@@ -79,7 +79,9 @@ impl GitHub for RealGitHub {
 
     async fn clone_repo(&self, name: &str, dest: &Path) -> Result<(), String> {
         let dest = dest.to_string_lossy();
-        run_gh(&["repo", "clone", name, &dest], CLONE_TIMEOUT)
+        // Pinned to the listing host: a bare `owner/repo` would follow GH_HOST.
+        let target = format!("{HOST}/{name}");
+        run_gh(&["repo", "clone", &target, &dest], CLONE_TIMEOUT)
             .await
             .map(|_| ())
     }
@@ -267,6 +269,18 @@ impl Remote {
                 names
             }
             None => self.inner.refresh().await,
+        }
+    }
+
+    /// Like [`Remote::get`], but a first listing slower than `wait` yields an
+    /// empty list instead of stalling the caller; the listing keeps running in
+    /// the background and a later call picks it up.
+    pub async fn get_within(&self, wait: Duration) -> Arc<Vec<String>> {
+        let this = self.clone();
+        let task = tokio::spawn(async move { this.get().await });
+        match tokio::time::timeout(wait, task).await {
+            Ok(Ok(names)) => names,
+            _ => Arc::default(),
         }
     }
 
@@ -494,6 +508,16 @@ mod tests {
         assert_eq!(*x, ["a/b"]);
         assert_eq!(x, y);
         assert_eq!(y, z);
+        assert_eq!(gh.lists.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn get_within_does_not_wait_for_a_slow_first_listing() {
+        let gh = FakeGitHub::new(Ok(vec!["a/b".into()]));
+        let r = remote_with(gh.clone());
+        assert!(r.get_within(Duration::from_millis(1)).await.is_empty());
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(*r.get_within(Duration::from_millis(1)).await, ["a/b"]);
         assert_eq!(gh.lists.load(Ordering::SeqCst), 1);
     }
 
