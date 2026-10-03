@@ -113,6 +113,9 @@ code { font-family: ui-monospace, monospace; }
   function say(text, err) { status.textContent = text; status.className = err ? "err" : ""; }
   function opt(value, text) { var o = document.createElement("option"); o.value = value; o.textContent = text; return o; }
   var allRepos = [];
+  // Remote-only entries have no path; they are told apart by a "remote:" prefix.
+  function valueOf(r) { return r.remote ? "remote:" + r.name : r.path; }
+  function isRemote() { return repo.value.indexOf("remote:") === 0; }
   // Case-insensitive substring match on the full name (owner/name) and the short name.
   function matches(r, q) {
     q = q.trim().toLowerCase();
@@ -132,8 +135,8 @@ code { font-family: ui-monospace, monospace; }
       none.disabled = true; none.selected = true;
       repo.appendChild(none);
     } else {
-      shown.forEach(function (r) { repo.appendChild(opt(r.path, r.name + "  (" + r.path + ")")); });
-      if (prev && shown.some(function (r) { return r.path === prev; })) repo.value = prev;
+      shown.forEach(function (r) { repo.appendChild(opt(valueOf(r), r.remote ? r.name + "  [remote]" : r.name + "  (" + r.path + ")")); });
+      if (prev && shown.some(function (r) { return valueOf(r) === prev; })) repo.value = prev;
     }
     go.disabled = !repo.value;
     maybeLoadSessions();
@@ -150,7 +153,7 @@ code { font-family: ui-monospace, monospace; }
     resume.appendChild(opt("", "(start new session)"));
     resumeLabel.hidden = true;
     go.textContent = "Start omp";
-    if (!repo.value) return;
+    if (!repo.value || isRemote()) return; // nothing cloned yet, so no past sessions
     fetch("/api/repos/" + encodeURIComponent(repo.value) + "/sessions")
       .then(function (r) { return r.json(); })
       .then(function (data) {
@@ -183,8 +186,8 @@ code { font-family: ui-monospace, monospace; }
   document.getElementById("ns-form").addEventListener("submit", function (ev) {
     ev.preventDefault();
     go.disabled = true;
-    var sessionId = resume.value;
-    say(sessionId ? "resuming..." : "starting...", false);
+    var sessionId = isRemote() ? "" : resume.value;
+    say(sessionId ? "resuming..." : isRemote() ? "cloning..." : "starting...", false);
     var req = sessionId
       ? fetch("/api/repos/" + encodeURIComponent(repo.value) + "/sessions/resume", {
           method: "POST",
@@ -194,7 +197,9 @@ code { font-family: ui-monospace, monospace; }
       : fetch("/api/sessions", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ path: repo.value, model: model.value || null })
+          body: JSON.stringify(isRemote()
+            ? { remote: repo.value.slice(7), model: model.value || null }
+            : { path: repo.value, model: model.value || null })
         });
     req.then(function (r) {
       if (r.status === 202) { say((sessionId ? "resuming" : "started") + "; it should appear below shortly", false); box.open = false; setTimeout(function () { location.reload(); }, 3000); return; }

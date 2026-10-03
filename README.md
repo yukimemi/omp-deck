@@ -102,7 +102,14 @@ contain quotes as single-quoted TOML strings. Roots that are missing or
 unreadable are skipped, and a checkout reachable through several roots is
 listed once. The scan is cached for 30 seconds.
 
-API: `GET /api/repos` (`{repos: [{name, path}], hint}`), `GET /api/models`,
+The picker also offers your GitHub repositories that are not checked out
+locally, marked `[remote]` (requires the `gh` CLI, logged in; without it the
+list is local-only). Starting a session on one first clones it with
+`gh repo clone` into `<first root>/github.com/<owner>/<repo>`; a clone failure
+is reported instead of starting a session. The remote list is cached for ten
+minutes. Needs at least one configured root.
+
+API: `GET /api/repos` (`{repos: [{name, path, remote}], hint}`), `GET /api/models`,
 `POST /api/sessions` with `{"path": "...", "model": "..."}` (`model` optional).
 It answers `202` right away; an unknown path is `404`, a model that is not a
 configured candidate is `400`, and a failed launch is `502` with the error.
