@@ -1062,11 +1062,12 @@ mod tests {
         let omp = FakeOmp::new(Ok(Vec::new()));
         let (status, body) = post_session(&omp, &l, json!({ "remote": "acme/tool" })).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        let want = t
-            .path()
-            .join("github.com/acme/tool")
-            .canonicalize()
-            .unwrap();
+        let want = std::path::PathBuf::from(repos::display_path(
+            &t.path()
+                .join("github.com/acme/tool")
+                .canonicalize()
+                .unwrap(),
+        ));
         assert_eq!(gh.clones.lock().unwrap().len(), 1);
         assert_eq!(*omp.starts.lock(), vec![(want, None)]);
     }
