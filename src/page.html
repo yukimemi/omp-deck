@@ -168,6 +168,19 @@ code { font-family: ui-monospace, monospace; }
   resume.addEventListener("change", function () {
     go.textContent = resume.value ? "Resume omp" : "Start omp";
   });
+  // The server's first GitHub listing was still running: ask again shortly so
+  // the remote entries appear without reopening the form.
+  function pollRepos(left) {
+    if (left <= 0) return;
+    setTimeout(function () {
+      if (!box.open) return;
+      fetch("/api/repos").then(function (r) { return r.json(); }).then(function (d) {
+        allRepos = d.repos || [];
+        renderRepos();
+        if (d.pending) pollRepos(left - 1);
+      }).catch(function () {});
+    }, 3000);
+  }
   box.addEventListener("toggle", function () {
     if (!box.open || loaded) return;
     loaded = true;
@@ -180,6 +193,7 @@ code { font-family: ui-monospace, monospace; }
       renderRepos();
       models.forEach(function (m) { model.appendChild(opt(m, m)); });
       modelLabel.hidden = models.length === 0;
+      if (both[0].pending) pollRepos(10);
       if (repos.length === 0) say(both[0].hint || "No repositories found under the configured roots.", false);
     }).catch(function (e) { loaded = false; say("could not load choices: " + e, true); });
   });

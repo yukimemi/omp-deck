@@ -273,14 +273,14 @@ impl Remote {
     }
 
     /// Like [`Remote::get`], but a first listing slower than `wait` yields an
-    /// empty list instead of stalling the caller; the listing keeps running in
+    /// `None` instead of stalling the caller; the listing keeps running in
     /// the background and a later call picks it up.
-    pub async fn get_within(&self, wait: Duration) -> Arc<Vec<String>> {
+    pub async fn get_within(&self, wait: Duration) -> Option<Arc<Vec<String>>> {
         let this = self.clone();
         let task = tokio::spawn(async move { this.get().await });
         match tokio::time::timeout(wait, task).await {
-            Ok(Ok(names)) => names,
-            _ => Arc::default(),
+            Ok(Ok(names)) => Some(names),
+            _ => None,
         }
     }
 
@@ -515,9 +515,12 @@ mod tests {
     async fn get_within_does_not_wait_for_a_slow_first_listing() {
         let gh = FakeGitHub::new(Ok(vec!["a/b".into()]));
         let r = remote_with(gh.clone());
-        assert!(r.get_within(Duration::from_millis(1)).await.is_empty());
+        assert!(r.get_within(Duration::from_millis(1)).await.is_none());
         tokio::time::sleep(Duration::from_millis(80)).await;
-        assert_eq!(*r.get_within(Duration::from_millis(1)).await, ["a/b"]);
+        assert_eq!(
+            *r.get_within(Duration::from_millis(1)).await.unwrap(),
+            ["a/b"]
+        );
         assert_eq!(gh.lists.load(Ordering::SeqCst), 1);
     }
 

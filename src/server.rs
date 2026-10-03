@@ -114,14 +114,18 @@ impl FromRef<AppState> for Arc<Launcher> {
 async fn api_repos(State(l): State<Arc<Launcher>>) -> Response {
     let local = l.repos.get().await;
     // Remote candidates are only useful (cloneable) when a root is configured.
-    let remote = if l.repos.has_roots() {
-        l.remote.get_within(FIRST_LISTING_WAIT).await
+    // `pending`: the first listing is still running, so the page should ask again.
+    let (remote, pending) = if l.repos.has_roots() {
+        match l.remote.get_within(FIRST_LISTING_WAIT).await {
+            Some(names) => (names, false),
+            None => (Default::default(), true),
+        }
     } else {
-        Default::default()
+        (Default::default(), false)
     };
     let repos = remote::merge(&local, &remote);
     let hint = (!l.repos.has_roots()).then_some(NO_ROOTS_HINT);
-    Json(json!({ "repos": repos, "hint": hint })).into_response()
+    Json(json!({ "repos": repos, "hint": hint, "pending": pending })).into_response()
 }
 
 async fn api_models(State(l): State<Arc<Launcher>>) -> Response {
