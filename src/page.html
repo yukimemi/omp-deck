@@ -45,6 +45,7 @@ details#new-session summary { cursor: pointer; font-weight: 600; }
 #ns-status.err { color: #c92a2a; }
 code { font-family: ui-monospace, monospace; }
 #self-update { display: flex; align-items: center; gap: .6rem; margin: 0 0 1rem; }
+#self-update[hidden] { display: none; }
 #su-btn { font: inherit; padding: .4rem .8rem; border-radius: .4rem; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
 #su-btn:disabled { opacity: .5; cursor: default; }
 #su-status { margin: 0; font-size: .85rem; color: var(--muted); overflow-wrap: anywhere; }
@@ -53,7 +54,7 @@ code { font-family: ui-monospace, monospace; }
 </head>
 <body>
 <h1>omp deck</h1>
-<div id="self-update">
+<div id="self-update" hidden>
 <button id="su-btn" type="button">Update &amp; restart</button>
 <p id="su-status" role="status"></p>
 </div>
@@ -73,6 +74,14 @@ code { font-family: ui-monospace, monospace; }
   var suBtn = document.getElementById("su-btn");
   var suStatus = document.getElementById("su-status");
   function suSay(text, err) { suStatus.textContent = text; suStatus.className = err ? "err" : ""; }
+  var suBox = document.getElementById("self-update");
+  // Hidden until the server reports a newer release; any failure leaves it hidden.
+  fetch("/api/update").then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
+    if (d && d.available === true && typeof d.to === "string" && d.to) {
+      suBtn.textContent = "Update to " + d.to;
+      suBox.hidden = false;
+    }
+  }).catch(function () {});
   suBtn.addEventListener("click", function () {
     if (!window.confirm("Check for a newer omp-deck release and restart onto it if found? The dashboard is briefly unreachable during the restart.")) return;
     suBtn.disabled = true;
@@ -86,7 +95,7 @@ code { font-family: ui-monospace, monospace; }
           setTimeout(function () { location.reload(); }, 8000);
         });
       }
-      if (r.status === 200) { suSay("already up to date", false); suBtn.disabled = false; return; }
+      if (r.status === 200) { suSay("already up to date", false); suBtn.disabled = false; suBox.hidden = true; return; }
       return r.text().then(function (t) { suSay("failed (" + r.status + "): " + t, true); suBtn.disabled = false; });
     }).catch(function (e) { suSay("failed: " + e, true); suBtn.disabled = false; });
   });

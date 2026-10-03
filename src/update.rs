@@ -17,7 +17,20 @@
 
 use async_trait::async_trait;
 use kaishin::{Checker, KaishinOptions, LatestRelease, UpdateOptions, check_latest_release};
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+
+/// How long `RealUpdater::known_update` trusts its last attempt, success or
+/// failure. Matches kaishin's own 24h background-check throttle.
+const KNOWN_UPDATE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Whether an attempt made at `attempted` is still within `ttl` at `now`.
+fn attempt_is_fresh(attempted: Instant, now: Instant, ttl: Duration) -> bool {
+    now.saturating_duration_since(attempted) < ttl
+}
+
+type KnownUpdate = Result<Option<LatestRelease>, String>;
 
 fn options() -> KaishinOptions {
     KaishinOptions::new(
@@ -139,6 +152,11 @@ pub trait SelfUpdater: Send + Sync {
     /// A real (uncached) check for a newer release. `Ok(None)` means already
     /// up to date -- nothing to install, nothing to restart.
     async fn newer_release(&self) -> Result<Option<LatestRelease>, String>;
+    /// The newest release as far as a cheap, throttled look can tell, for
+    /// the dashboard to decide whether to show its update button. Unlike
+    /// [`SelfUpdater::newer_release`] this may answer from a cache and never
+    /// forces a GitHub call per page load. `Ok(None)` = up to date.
+    async fn known_update(&self) -> Result<Option<LatestRelease>, String>;
     /// Installs the newer release in place and leaves it for the caller to
     /// hand the listening socket over to a successor process. Non-interactive
     /// (`yes = true`): nobody is at a terminal to answer a prompt.
@@ -147,11 +165,16 @@ pub trait SelfUpdater: Send + Sync {
 
 /// The real backend, used by `omp-deck serve`.
 #[derive(Default)]
-pub struct RealUpdater;
+pub struct RealUpdater {
+    /// The last `known_update` attempt and its outcome (failures included,
+    /// so an unreachable GitHub is not retried on every page load). Held
+    /// across the check so concurrent callers coalesce into one fetch.
+    known: Mutex<Option<(Instant, KnownUpdate)>>,
+}
 
 impl RealUpdater {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -169,6 +192,23 @@ impl SelfUpdater for RealUpdater {
         let available = kaishin::is_update_available(&opts.current_version, &latest.tag_name)
             .map_err(|e| e.to_string())?;
         Ok(available.then_some(latest))
+    }
+
+    async fn known_update(&self) -> Result<Option<LatestRelease>, String> {
+        let mut known = self.known.lock().await;
+        if let Some((attempted, result)) = known.as_ref()
+            && attempt_is_fresh(*attempted, Instant::now(), KNOWN_UPDATE_TTL)
+        {
+            return result.clone();
+        }
+        let checker = Checker::new(env!("CARGO_PKG_NAME"), options());
+        let result = if checker.should_check() {
+            checker.check_and_save().await.map_err(|e| e.to_string())
+        } else {
+            Ok(checker.cached_update())
+        };
+        *known = Some((Instant::now(), result.clone()));
+        result
     }
 
     async fn install(&self) -> Result<(), String> {
@@ -299,6 +339,17 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(disabled_by(input), expected, "input {input:?}");
         }
+    }
+
+    #[test]
+    fn attempt_freshness_expires_at_the_ttl() {
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(10);
+        assert!(attempt_is_fresh(t0, t0, ttl));
+        assert!(attempt_is_fresh(t0, t0 + Duration::from_secs(9), ttl));
+        assert!(!attempt_is_fresh(t0, t0 + ttl, ttl));
+        // A clock that appears to run backwards still counts as fresh.
+        assert!(attempt_is_fresh(t0 + ttl, t0, ttl));
     }
 
     #[test]
