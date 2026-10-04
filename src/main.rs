@@ -54,6 +54,12 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
         argv: Vec<String>,
     },
+    /// Take over a headless session from this terminal: stop it, then run
+    /// `omp --resume` in the foreground
+    Resume {
+        /// Instance id, session id or a unique prefix of either (default: pick from a list)
+        id: Option<String>,
+    },
     /// Check for and install a newer omp-deck release
     SelfUpdate {
         /// Install without prompting
@@ -82,7 +88,11 @@ fn main() -> ExitCode {
 async fn run(cli: Cli) -> ExitCode {
     // Skip the background check for `self-update` itself: it already does
     // its own explicit check, and the two would race the same GitHub call.
-    let auto_update = if matches!(cli.command, Command::SelfUpdate { .. }) {
+    // Also skipped for `resume`: a banner would mix into the foreground TUI.
+    let auto_update = if matches!(
+        cli.command,
+        Command::SelfUpdate { .. } | Command::Resume { .. }
+    ) {
         None
     } else {
         update::maybe_spawn_auto_update_check()
@@ -95,6 +105,15 @@ async fn run(cli: Cli) -> ExitCode {
             discord_webhook,
         } => serve(omp, omp_path, bind, discord_webhook, cli.config).await,
         Command::List { json } => list(&omp, json).await,
+        Command::Resume { id } => {
+            return match omp_deck::takeover::run(&omp, id.as_deref()).await {
+                Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+                Err(msg) => {
+                    eprintln!("omp-deck: {msg}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Command::SelfUpdate { yes, check } => update::run_self_update(yes, check).await,
         Command::PtyHost { .. } => unreachable!("handled before the runtime starts"),
     };

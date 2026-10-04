@@ -12,6 +12,7 @@ pub mod remote;
 pub mod repos;
 pub mod server;
 pub mod sessions;
+pub mod takeover;
 pub mod update;
 pub mod view;
 

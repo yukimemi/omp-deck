@@ -32,9 +32,18 @@ omp config set collab.autoStart control
 ```sh
 omp-deck serve [--bind ADDR:PORT] [--discord-webhook URL] [--config FILE]   # prints the URL on stdout
 omp-deck list [--json]                                      # terminal table / parsed model
+omp-deck resume [<id>]                                      # take over a headless session on this terminal
 omp-deck self-update [--yes] [--check]                       # update the binary itself
 ```
 
+- `resume` lists the live sessions (numbered), asks which one, stops that
+  headless instance (kills its pid, as the web "resume" does) and runs
+  `omp --cwd <cwd> --resume=<id>` in the foreground, so this terminal owns
+  it. `<id>` (instance id, session id or a unique prefix) skips the picker.
+  With stdout not a terminal it only prints the list and exits non-zero. omp
+  re-publishes through `collab.autoStart`, but under a new instance id, so
+  fetch the phone link again. If omp cannot be started after the stop, the
+  error prints the `omp --cwd … --resume=…` command to run by hand.
 - Without `--bind`, the server listens on this machine's Tailscale IPv4
   address (`tailscale ip -4`) on a port the OS picks. If Tailscale cannot be
   queried it falls back to `127.0.0.1` and says so on stderr. It never defaults
