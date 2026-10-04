@@ -2,7 +2,7 @@
 //! that only ever appear in a `Location` header, fetched fresh per request.
 
 use crate::model::Host;
-use crate::omp::{Access, Omp, OmpError};
+use crate::omp::{Access, Omp, OmpError, resume_target};
 use crate::remote;
 use crate::repos;
 use crate::sessions;
@@ -232,17 +232,6 @@ async fn api_stop(State(omp): State<Shared>, Path(instance_id): Path<String>) ->
     }
 }
 
-/// Only characters `omp` session ids are known to use, and never a leading
-/// `-` (which `--resume=<value>` already neutralizes, but a hand-checked
-/// value is one less thing to trust from a subprocess's stdout).
-fn valid_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && !id.starts_with('-')
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
-
 async fn api_resume(State(omp): State<Shared>, Path(instance_id): Path<String>) -> Response {
     // Same rule as api_stop and go: only ever act on a pid/cwd/session id
     // omp itself just reported for this instance id, never the request's.
@@ -253,25 +242,11 @@ async fn api_resume(State(omp): State<Shared>, Path(instance_id): Path<String>) 
     let Some(host) = hosts.iter().find(|h| h.instance_id == instance_id) else {
         return plain(StatusCode::NOT_FOUND, "no such live omp session");
     };
-    let Some(pid) = host.pid else {
-        return plain(
-            StatusCode::BAD_GATEWAY,
-            "omp did not report a pid for this session",
-        );
+    let target = match resume_target(host) {
+        Ok(t) => t,
+        Err(msg) => return plain(StatusCode::BAD_GATEWAY, msg),
     };
-    if host.cwd.is_empty() {
-        return plain(
-            StatusCode::BAD_GATEWAY,
-            "omp did not report a cwd for this session",
-        );
-    }
-    if !valid_session_id(&host.session_id) {
-        return plain(
-            StatusCode::BAD_GATEWAY,
-            "omp did not report a usable session id",
-        );
-    }
-    if let Err(e) = omp.stop(pid).await {
+    if let Err(e) = omp.stop(target.pid).await {
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({ "error": e.to_string() })),
@@ -279,7 +254,7 @@ async fn api_resume(State(omp): State<Shared>, Path(instance_id): Path<String>) 
             .into_response();
     }
     match omp
-        .resume(std::path::Path::new(&host.cwd), &host.session_id)
+        .resume(std::path::Path::new(&target.cwd), &target.session_id)
         .await
     {
         Ok(()) => (StatusCode::ACCEPTED, Json(json!({ "resumed": true }))).into_response(),

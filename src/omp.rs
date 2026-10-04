@@ -91,6 +91,82 @@ fn unsafe_for_cmd(arg: &str) -> bool {
             .any(|c| matches!(c, '"' | '%' | '!') || c.is_control())
 }
 
+/// Only characters `omp` session ids are known to use, and never a leading
+/// `-` (which `--resume=<value>` already neutralizes, but a hand-checked
+/// value is one less thing to trust from a subprocess's stdout).
+pub fn valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// What a resume of a live instance acts on, all of it taken from what
+/// `omp collab list` reported for that instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeTarget {
+    pub pid: u32,
+    pub cwd: String,
+    pub session_id: String,
+}
+
+/// Check that a listed host can be stopped and resumed. The message is
+/// shown to the user as-is (the web UI sends it as the 502 body).
+pub fn resume_target(host: &Host) -> Result<ResumeTarget, &'static str> {
+    let Some(pid) = host.pid else {
+        return Err("omp did not report a pid for this session");
+    };
+    if host.cwd.is_empty() {
+        return Err("omp did not report a cwd for this session");
+    }
+    if !valid_session_id(&host.session_id) {
+        return Err("omp did not report a usable session id");
+    }
+    Ok(ResumeTarget {
+        pid,
+        cwd: host.cwd.clone(),
+        session_id: host.session_id.clone(),
+    })
+}
+
+/// Arguments that reopen a saved session: `--cwd <cwd> --resume=<id>`.
+pub fn resume_args(cwd: &str, session_id: &str) -> Vec<String> {
+    vec![
+        "--cwd".to_string(),
+        cwd.to_string(),
+        format!("--resume={session_id}"),
+    ]
+}
+
+/// A command that runs `omp` in the foreground on the caller's terminal
+/// (stdio inherited). Unlike [`spawn_detached`] there is no `start`, new
+/// console or pty: the host terminal owns the TUI. On Windows `std` runs a
+/// `.cmd` through `cmd.exe` and escapes the arguments itself.
+pub fn foreground_command(exe: &Path, args: &[String]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    cmd
+}
+
+/// Whether `exe`/`args` can be passed through `cmd.exe` at all; always true
+/// off Windows. Checked before anything is stopped.
+pub fn passes_cmd_safely(exe: &Path, args: &[String]) -> bool {
+    #[cfg(windows)]
+    {
+        let exe = exe.display().to_string();
+        !std::iter::once(&exe).chain(args).any(|a| unsafe_for_cmd(a))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (exe, args);
+        true
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct LinkOutput {
     url: String,
@@ -120,7 +196,7 @@ impl RealOmp {
     }
 
     /// Explicit path first, then PATH lookup preferring `omp.exe` over `omp.cmd`.
-    fn resolve(&self) -> Result<PathBuf, OmpError> {
+    pub fn resolve(&self) -> Result<PathBuf, OmpError> {
         if let Some(path) = &self.explicit {
             return Ok(path.clone());
         }
@@ -197,11 +273,7 @@ impl Omp for RealOmp {
     async fn resume(&self, cwd: &Path, session_id: &str) -> Result<(), OmpError> {
         let exe = self.resolve()?;
         let host = self.host.clone();
-        let args = vec![
-            "--cwd".to_string(),
-            cwd.display().to_string(),
-            format!("--resume={session_id}"),
-        ];
+        let args = resume_args(&cwd.display().to_string(), session_id);
         tokio::task::spawn_blocking(move || spawn_detached(host.as_deref(), &exe, &args))
             .await
             .map_err(|e| OmpError::Spawn(e.to_string()))?
@@ -989,5 +1061,62 @@ mod tests {
             matches!(result, Err(OmpError::Exit { code: Some(7), .. })),
             "{result:?}"
         );
+    }
+
+    fn host(pid: Option<u32>, cwd: &str, session_id: &str) -> Host {
+        Host {
+            pid,
+            cwd: cwd.into(),
+            session_id: session_id.into(),
+            ..serde_json::from_str(r#"{"instanceId":"i"}"#).unwrap()
+        }
+    }
+
+    #[test]
+    fn resume_target_validates_pid_cwd_and_session_id() {
+        let ok = resume_target(&host(Some(7), "/w", "abc_1.2-x")).unwrap();
+        assert_eq!(
+            ok,
+            ResumeTarget {
+                pid: 7,
+                cwd: "/w".into(),
+                session_id: "abc_1.2-x".into()
+            }
+        );
+        assert!(
+            resume_target(&host(None, "/w", "abc"))
+                .unwrap_err()
+                .contains("pid")
+        );
+        assert!(
+            resume_target(&host(Some(7), "", "abc"))
+                .unwrap_err()
+                .contains("cwd")
+        );
+        for bad in ["", "-x", "a b", "a/b"] {
+            assert!(
+                resume_target(&host(Some(7), "/w", bad))
+                    .unwrap_err()
+                    .contains("session id"),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_args_shape() {
+        assert_eq!(
+            resume_args("/w", "abc"),
+            vec!["--cwd", "/w", "--resume=abc"]
+        );
+    }
+
+    #[test]
+    fn foreground_command_keeps_exe_and_args() {
+        let args = resume_args("/w", "abc");
+        let cmd = foreground_command(Path::new("omp"), &args);
+        assert_eq!(cmd.get_program(), "omp");
+        let got: Vec<_> = cmd.get_args().collect();
+        assert_eq!(got, vec!["--cwd", "/w", "--resume=abc"]);
     }
 }
