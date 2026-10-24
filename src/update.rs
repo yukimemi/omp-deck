@@ -424,95 +424,147 @@ mod tests {
         }
     }
 
+    /// Scripted clock and fetcher exercise the same cache path as RealUpdater.
+    struct WebCacheRig {
+        cache: Mutex<WebCache>,
+        clock: std::sync::Mutex<Instant>,
+        answer: std::sync::Mutex<KnownUpdate>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WebCacheRig {
+        fn new() -> Self {
+            Self {
+                cache: Mutex::new(WebCache::default()),
+                clock: std::sync::Mutex::new(Instant::now()),
+                answer: std::sync::Mutex::new(Ok(None)),
+                calls: 0.into(),
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            *self.clock.lock().unwrap() += duration;
+        }
+
+        fn set(&self, answer: KnownUpdate) {
+            *self.answer.lock().unwrap() = answer;
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn check(&self, mode: CheckMode) -> UpdateStatus {
+            self.cache
+                .lock()
+                .await
+                .check(
+                    mode,
+                    || *self.clock.lock().unwrap(),
+                    || async {
+                        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        self.answer.lock().unwrap().clone()
+                    },
+                )
+                .await
+        }
+    }
+
     #[tokio::test]
     async fn web_negative_expires_and_manual_bypasses_automatic_negative() {
-        let t = Instant::now();
-        let mut cache = WebCache::default();
-        cache
-            .check(CheckMode::Automatic, || t, || async { Ok(None) })
-            .await;
-        let cached = cache
-            .check(
-                CheckMode::Automatic,
-                || t,
-                || async { panic!("a page load must use the cache") },
-            )
-            .await;
-        assert!(cached.latest.is_none());
-        let fresh = cache
-            .check(
-                CheckMode::Automatic,
-                || t + KNOWN_UPDATE_TTL,
-                || async { Ok(Some(release())) },
-            )
-            .await;
-        assert!(fresh.latest.is_some());
+        let rig = WebCacheRig::new();
+        assert!(rig.check(CheckMode::Automatic).await.latest.is_none());
+        rig.set(Ok(Some(release())));
+        rig.advance(KNOWN_UPDATE_TTL - Duration::from_secs(1));
+        assert!(rig.check(CheckMode::Automatic).await.latest.is_none());
+        assert_eq!(rig.calls(), 1);
+        rig.advance(Duration::from_secs(1));
+        assert!(rig.check(CheckMode::Automatic).await.latest.is_some());
+        assert_eq!(rig.calls(), 2);
 
-        let mut cache = WebCache::default();
-        cache
-            .check(CheckMode::Automatic, || t, || async { Ok(None) })
-            .await;
-        let manual = cache
-            .check(CheckMode::Manual, || t, || async { Ok(Some(release())) })
-            .await;
-        assert!(manual.latest.is_some());
-        cache
-            .check(
-                CheckMode::Manual,
-                || t,
-                || async { panic!("manual cooldown") },
-            )
-            .await;
-        let refreshed = cache
-            .check(CheckMode::Manual, || t + RETRY_TTL, || async { Ok(None) })
-            .await;
-        assert!(refreshed.latest.is_none());
+        let rig = WebCacheRig::new();
+        rig.check(CheckMode::Automatic).await;
+        rig.set(Ok(Some(release())));
+        assert!(rig.check(CheckMode::Manual).await.latest.is_some());
+        assert_eq!(rig.calls(), 2);
+        rig.set(Ok(None));
+        rig.advance(RETRY_TTL - Duration::from_secs(1));
+        assert!(rig.check(CheckMode::Manual).await.latest.is_some());
+        assert_eq!(rig.calls(), 2);
+        rig.advance(Duration::from_secs(1));
+        assert!(rig.check(CheckMode::Manual).await.latest.is_none());
+        assert_eq!(rig.calls(), 3);
     }
 
     #[tokio::test]
     async fn web_failures_retry_and_preserve_known_release() {
-        let t = Instant::now();
-        let mut cache = WebCache::default();
-        let failed = cache
-            .check(
-                CheckMode::Automatic,
-                || t,
-                || async { Err("offline".into()) },
-            )
-            .await;
+        let rig = WebCacheRig::new();
+        rig.set(Err("offline".into()));
+        let failed = rig.check(CheckMode::Automatic).await;
         assert_eq!(failed.error.as_deref(), Some("offline"));
-        cache
-            .check(
-                CheckMode::Automatic,
-                || t,
-                || async { panic!("error cooldown") },
-            )
-            .await;
-        let recovered = cache
-            .check(
-                CheckMode::Automatic,
-                || t + RETRY_TTL,
-                || async { Ok(Some(release())) },
-            )
-            .await;
+        rig.set(Ok(Some(release())));
+        rig.advance(RETRY_TTL - Duration::from_secs(1));
+        assert!(rig.check(CheckMode::Automatic).await.error.is_some());
+        assert_eq!(rig.calls(), 1);
+        rig.advance(Duration::from_secs(1));
+        let recovered = rig.check(CheckMode::Automatic).await;
         assert!(recovered.error.is_none());
-        let failed = cache
-            .check(
-                CheckMode::Manual,
-                || t + RETRY_TTL,
-                || async { Err("offline".into()) },
-            )
-            .await;
+        assert!(recovered.latest.is_some());
+        assert_eq!(rig.calls(), 2);
+        rig.set(Err("offline".into()));
+        let failed = rig.check(CheckMode::Manual).await;
         assert!(failed.latest.is_some());
         assert!(
             checked_result(failed).is_err(),
             "an install must not proceed from stale data"
         );
-        let refreshed = cache
-            .check(CheckMode::Install, || t + RETRY_TTL, || async { Ok(None) })
-            .await;
+        rig.set(Ok(None));
+        let refreshed = rig.check(CheckMode::Install).await;
         assert!(refreshed.latest.is_none());
         assert!(refreshed.error.is_none());
+        assert_eq!(rig.calls(), 4);
+    }
+
+    #[tokio::test]
+    async fn install_check_result_updates_the_web_cache() {
+        let rig = WebCacheRig::new();
+        rig.check(CheckMode::Automatic).await;
+        // Even a fresh manual negative must not suppress the install check.
+        rig.check(CheckMode::Manual).await;
+        rig.set(Ok(Some(release())));
+        rig.advance(Duration::from_secs(1));
+        let checked = checked_result(rig.check(CheckMode::Install).await).unwrap();
+        assert_eq!(checked.unwrap().tag_name, release().tag_name);
+        assert_eq!(rig.calls(), 3);
+        let cached = rig.check(CheckMode::Automatic).await;
+        assert_eq!(cached.latest.unwrap().tag_name, release().tag_name);
+        assert!(cached.error.is_none());
+        assert_eq!(rig.calls(), 3);
+
+        rig.set(Err("offline".into()));
+        assert!(checked_result(rig.check(CheckMode::Install).await).is_err());
+        let cached = rig.check(CheckMode::Automatic).await;
+        assert_eq!(cached.error.as_deref(), Some("offline"));
+        assert!(cached.latest.is_some());
+        assert_eq!(rig.calls(), 4);
+
+        rig.set(Ok(None));
+        assert!(
+            checked_result(rig.check(CheckMode::Install).await)
+                .unwrap()
+                .is_none()
+        );
+        let cached = rig.check(CheckMode::Automatic).await;
+        assert!(cached.latest.is_none());
+        assert!(cached.error.is_none());
+        assert_eq!(rig.calls(), 5);
+        // Successful pre-install checks restart the automatic success TTL.
+        rig.advance(KNOWN_UPDATE_TTL - Duration::from_secs(1));
+        rig.check(CheckMode::Automatic).await;
+        assert_eq!(rig.calls(), 5);
+        rig.advance(Duration::from_secs(1));
+        rig.check(CheckMode::Automatic).await;
+        assert_eq!(rig.calls(), 6);
     }
 
     #[tokio::test]
