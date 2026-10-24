@@ -6,6 +6,20 @@ use std::fmt::Write as _;
 const PAGE: &str = include_str!("page.html");
 const BODY_MARKER: &str = "<!--BODY-->";
 
+/// Remove leading terminal-font decorations for browser display. Private-use
+/// glyphs have no portable appearance without the terminal's icon font.
+/// Only an initial run of icons and its separating whitespace is removed;
+/// ordinary titles and everything after the first text character stay intact.
+pub fn browser_title(title: &str) -> &str {
+    let is_icon = |c| matches!(c, '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{ffffd}' | '\u{100000}'..='\u{10fffd}');
+    let start = title.trim_start();
+    if start.starts_with(is_icon) {
+        start.trim_start_matches(|c: char| is_icon(c) || c.is_whitespace())
+    } else {
+        title
+    }
+}
+
 /// Escape text for use in HTML element content and double-quoted attributes.
 pub fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -89,6 +103,12 @@ impl Status {
 }
 
 fn render_card(host: &Host, now_ms: i64) -> String {
+    let title = browser_title(host.display_name());
+    let name = if title.is_empty() {
+        host.unnamed_display_name()
+    } else {
+        title
+    };
     let status = Status::of(host);
     let id = encode_segment(&host.instance_id);
     let mut meta = Vec::new();
@@ -123,7 +143,7 @@ fn render_card(host: &Host, now_ms: i64) -> String {
          data-id=\"{id}\">close</button></p>\n\
          </article>\n",
         class = status.class(),
-        name = escape_html(host.display_name()),
+        name = escape_html(name),
         label = status.label(),
         cwd = escape_html(&host.cwd),
         meta = meta.join(" &middot; "),
@@ -204,6 +224,102 @@ mod tests {
 
     const FIXTURE: &str = include_str!("../tests/fixtures/hosts.json");
     const NOW: i64 = 1_700_000_000_000 + 5 * 60_000;
+
+    const AFFECTED_TITLES: [(&str, &str); 4] = [
+        (
+            "\u{f0093} RSRCH: Investigate magi.toml merge approval config",
+            "RSRCH: Investigate magi.toml merge approval config",
+        ),
+        (
+            "\u{f0199} ATTMPT: Investigate task 0bd5 attempt growth",
+            "ATTMPT: Investigate task 0bd5 attempt growth",
+        ),
+        (
+            "\u{f0668} FLAKY: Fix flaky CI tests at root",
+            "FLAKY: Fix flaky CI tests at root",
+        ),
+        (
+            "\u{f04c1} SPLIT: Separate magi web serve run for restart",
+            "SPLIT: Separate magi web serve run for restart",
+        ),
+    ];
+
+    #[test]
+    fn browser_title_strips_only_leading_private_use_decorations() {
+        for (raw, expected) in AFFECTED_TITLES {
+            assert_eq!(browser_title(raw), expected);
+        }
+        for icon in [
+            '\u{e000}',
+            '\u{e6ae}',
+            '\u{f407}',
+            '\u{f8ff}',
+            '\u{f0000}',
+            '\u{ffffd}',
+            '\u{100000}',
+            '\u{10fffd}',
+        ] {
+            assert_eq!(
+                browser_title(&format!("  {icon}\t{icon}  日本語  🧪 ")),
+                "日本語  🧪 "
+            );
+            assert_eq!(browser_title(&format!("{icon} ")), "");
+        }
+        for text in [
+            "",
+            " ",
+            "  plain  text  ",
+            "Add beat-synchronized workout choreography",
+            "日本語",
+            "🧪 Test",
+            "↔ Split",
+            "✈\u{fe0f} flight",
+            "a\u{200d}b",
+            "a\t b",
+            "Body \u{f0093}",
+            "\u{d7ff} before",
+            "\u{f900} after",
+            "\u{effff} before supplementary private use",
+            "\u{ffffe} noncharacter",
+            "\u{fffff} noncharacter",
+            "\u{10fffe} noncharacter",
+            "\u{10ffff} noncharacter",
+            "<>&\"'",
+        ] {
+            assert_eq!(browser_title(text), text);
+            // Separator whitespace is removed only after an icon prefix.
+            assert_eq!(
+                browser_title(&format!("\u{f0093} {text}")),
+                text.trim_start()
+            );
+        }
+    }
+
+    #[test]
+    fn cards_use_browser_titles_and_table_keeps_terminal_icons() {
+        let mut host = parse_hosts(FIXTURE).unwrap().remove(0);
+        for (raw, expected) in AFFECTED_TITLES.into_iter().chain([
+            ("plain 日本語 🧪", "plain 日本語 🧪"),
+            ("\u{e6ae} <script>&\"' \u{f407}", "<script>&\"' \u{f407}"),
+        ]) {
+            host.session_name = Some(raw.into());
+            let html = render_card(&host, NOW);
+            assert!(html.contains(&format!(">{}</h2>", escape_html(expected))));
+            assert_eq!(host.display_name(), raw);
+            assert!(render_table(std::slice::from_ref(&host), NOW).contains(raw));
+        }
+        host.session_name = Some("\u{f0093} \u{f0199} ".into());
+        host.cwd = "/work/project".into();
+        assert!(render_card(&host, NOW).contains(">project</h2>"));
+        host.cwd.clear();
+        assert!(render_card(&host, NOW).contains(&format!(">{}</h2>", host.instance_id)));
+    }
+
+    #[test]
+    fn resume_options_use_browser_titles_as_text() {
+        assert!(PAGE.contains("opt(s.sessionId, s.displayTitle || s.title)"));
+        assert!(PAGE.contains("o.textContent = text"));
+    }
 
     #[test]
     fn relative_time_buckets() {
