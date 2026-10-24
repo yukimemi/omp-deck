@@ -28,6 +28,6 @@ dirs = "6"
 libc = "0.2.191"
 
 [dev-dependencies]
-parking_lot = "0.12.5"
+parking_lot = "0.13.0"
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
