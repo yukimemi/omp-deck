@@ -159,7 +159,7 @@ code { font-family: ui-monospace, monospace; }
       .then(function (data) {
         if (repo.value !== sessionsFor) return; // selection moved on while this was in flight
         var list = data.sessions || [];
-        list.forEach(function (s) { resume.appendChild(opt(s.sessionId, s.displayTitle)); });
+        list.forEach(function (s) { resume.appendChild(opt(s.sessionId, s.displayTitle || s.title)); });
         resumeLabel.hidden = list.length === 0;
       })
       .catch(function () { resumeLabel.hidden = true; });

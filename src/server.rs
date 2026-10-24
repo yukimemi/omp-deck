@@ -281,12 +281,13 @@ async fn api_repo_sessions(State(l): State<Arc<Launcher>>, Path(path): Path<Stri
         .iter()
         .map(|entry| {
             let title = view::browser_title(&entry.title);
-            json!({
-                "sessionId": entry.session_id,
-                "title": entry.title,
-                "updatedAtMs": entry.updated_at_ms,
-                "displayTitle": if title.is_empty() { &entry.session_id } else { title },
-            })
+            let mut value = serde_json::to_value(entry).expect("SessionEntry serializes to JSON");
+            value["displayTitle"] = json!(if title.is_empty() {
+                &entry.session_id
+            } else {
+                title
+            });
+            value
         })
         .collect();
     Json(json!({ "sessions": entries })).into_response()
@@ -1313,6 +1314,11 @@ mod tests {
                 1,
             );
         }
+        let original_entries = sessions::list(
+            l.sessions_root.as_ref().unwrap(),
+            l.home.as_deref(),
+            std::path::Path::new(&path),
+        );
         let (status, body) = call(
             router(fixture(), l),
             Request::get(format!("/api/repos/{}/sessions", encode_path(&path)))
@@ -1323,6 +1329,15 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let entries = v["sessions"].as_array().unwrap();
+        for original in &original_entries {
+            let mut entry = entries
+                .iter()
+                .find(|e| e["sessionId"] == original.session_id)
+                .unwrap()
+                .clone();
+            entry.as_object_mut().unwrap().remove("displayTitle");
+            assert_eq!(entry, serde_json::to_value(original).unwrap());
+        }
         for (i, (raw, display)) in cases.iter().enumerate() {
             let entry = entries
                 .iter()

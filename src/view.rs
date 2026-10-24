@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn resume_options_use_browser_titles_as_text() {
-        assert!(PAGE.contains("opt(s.sessionId, s.displayTitle)"));
+        assert!(PAGE.contains("opt(s.sessionId, s.displayTitle || s.title)"));
         assert!(PAGE.contains("o.textContent = text"));
     }
 
