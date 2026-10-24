@@ -21,16 +21,95 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-/// How long `RealUpdater::known_update` trusts its last attempt, success or
-/// failure. Matches kaishin's own 24h background-check throttle.
-const KNOWN_UPDATE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+// Web discovery is independent of the CLI notification's persisted 24h state.
+const KNOWN_UPDATE_TTL: Duration = Duration::from_secs(5 * 60);
+const RETRY_TTL: Duration = Duration::from_secs(30);
 
-/// Whether an attempt made at `attempted` is still within `ttl` at `now`.
 fn attempt_is_fresh(attempted: Instant, now: Instant, ttl: Duration) -> bool {
     now.saturating_duration_since(attempted) < ttl
 }
 
 type KnownUpdate = Result<Option<LatestRelease>, String>;
+
+#[derive(Clone, Default)]
+pub struct UpdateStatus {
+    pub latest: Option<LatestRelease>,
+    pub error: Option<String>,
+}
+
+impl From<KnownUpdate> for UpdateStatus {
+    fn from(result: KnownUpdate) -> Self {
+        match result {
+            Ok(latest) => Self {
+                latest,
+                error: None,
+            },
+            Err(error) => Self {
+                latest: None,
+                error: Some(error),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CheckMode {
+    Automatic,
+    Manual,
+    Install,
+}
+
+#[derive(Default)]
+struct WebCache {
+    attempted: Option<Instant>,
+    manual: Option<Instant>,
+    status: UpdateStatus,
+}
+
+impl WebCache {
+    // Caller holds the mutex through the fetch, coalescing concurrent requests.
+    // A manual check has its own cooldown: an automatic negative never blocks it.
+    async fn check<F, Fut, C>(&mut self, mode: CheckMode, now: C, fetch: F) -> UpdateStatus
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = KnownUpdate>,
+        C: Fn() -> Instant,
+    {
+        let ttl = if self.status.error.is_some() {
+            RETRY_TTL
+        } else {
+            KNOWN_UPDATE_TTL
+        };
+        let fresh = match mode {
+            CheckMode::Automatic => self
+                .attempted
+                .is_some_and(|t| attempt_is_fresh(t, now(), ttl)),
+            CheckMode::Manual => self
+                .manual
+                .is_some_and(|t| attempt_is_fresh(t, now(), RETRY_TTL)),
+            CheckMode::Install => false,
+        };
+        if fresh {
+            return self.status.clone();
+        }
+        match fetch().await {
+            Ok(latest) => {
+                self.status = UpdateStatus {
+                    latest,
+                    error: None,
+                }
+            }
+            // Keep a previously discovered update visible during an outage.
+            Err(error) => self.status.error = Some(error),
+        }
+        let completed = now();
+        self.attempted = Some(completed);
+        if matches!(mode, CheckMode::Manual) {
+            self.manual = Some(completed);
+        }
+        self.status.clone()
+    }
+}
 
 fn options() -> KaishinOptions {
     KaishinOptions::new(
@@ -153,10 +232,13 @@ pub trait SelfUpdater: Send + Sync {
     /// up to date -- nothing to install, nothing to restart.
     async fn newer_release(&self) -> Result<Option<LatestRelease>, String>;
     /// The newest release as far as a cheap, throttled look can tell, for
-    /// the dashboard to decide whether to show its update button. Unlike
-    /// [`SelfUpdater::newer_release`] this may answer from a cache and never
-    /// forces a GitHub call per page load. `Ok(None)` = up to date.
-    async fn known_update(&self) -> Result<Option<LatestRelease>, String>;
+    /// the dashboard to show availability and discovery errors. Unlike
+    /// [`SelfUpdater::newer_release`] this may answer from a cache. A failed
+    /// refresh retains the last known update alongside the error.
+    async fn known_update(&self) -> UpdateStatus;
+    /// Explicit discovery, independent of the automatic TTL; repeated manual
+    /// checks may share a short cooldown. Never installs or restarts.
+    async fn check_update(&self) -> Result<Option<LatestRelease>, String>;
     /// Installs the newer release in place and leaves it for the caller to
     /// hand the listening socket over to a successor process. Non-interactive
     /// (`yes = true`): nobody is at a terminal to answer a prompt.
@@ -166,15 +248,39 @@ pub trait SelfUpdater: Send + Sync {
 /// The real backend, used by `omp-deck serve`.
 #[derive(Default)]
 pub struct RealUpdater {
-    /// The last `known_update` attempt and its outcome (failures included,
-    /// so an unreachable GitHub is not retried on every page load). Held
-    /// across the check so concurrent callers coalesce into one fetch.
-    known: Mutex<Option<(Instant, KnownUpdate)>>,
+    known: Mutex<WebCache>,
 }
 
 impl RealUpdater {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    async fn check(&self, mode: CheckMode) -> UpdateStatus {
+        if self.disabled() {
+            return Err("self-update disabled (OMP_DECK_NO_AUTOUPDATE)".to_string()).into();
+        }
+        self.known
+            .lock()
+            .await
+            .check(mode, Instant::now, || async {
+                let opts = options();
+                let latest = check_latest_release(&opts)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let available =
+                    kaishin::is_update_available(&opts.current_version, &latest.tag_name)
+                        .map_err(|e| e.to_string())?;
+                Ok(available.then_some(latest))
+            })
+            .await
+    }
+}
+
+fn checked_result(status: UpdateStatus) -> KnownUpdate {
+    match status.error {
+        Some(error) => Err(error),
+        None => Ok(status.latest),
     }
 }
 
@@ -184,34 +290,22 @@ impl SelfUpdater for RealUpdater {
         auto_update_disabled_by_env()
     }
 
-    async fn newer_release(&self) -> Result<Option<LatestRelease>, String> {
-        let opts = options();
-        let latest = check_latest_release(&opts)
-            .await
-            .map_err(|e| e.to_string())?;
-        let available = kaishin::is_update_available(&opts.current_version, &latest.tag_name)
-            .map_err(|e| e.to_string())?;
-        Ok(available.then_some(latest))
+    async fn newer_release(&self) -> KnownUpdate {
+        checked_result(self.check(CheckMode::Install).await)
     }
 
-    async fn known_update(&self) -> Result<Option<LatestRelease>, String> {
-        let mut known = self.known.lock().await;
-        if let Some((attempted, result)) = known.as_ref()
-            && attempt_is_fresh(*attempted, Instant::now(), KNOWN_UPDATE_TTL)
-        {
-            return result.clone();
-        }
-        let checker = Checker::new(env!("CARGO_PKG_NAME"), options());
-        let result = if checker.should_check() {
-            checker.check_and_save().await.map_err(|e| e.to_string())
-        } else {
-            Ok(checker.cached_update())
-        };
-        *known = Some((Instant::now(), result.clone()));
-        result
+    async fn known_update(&self) -> UpdateStatus {
+        self.check(CheckMode::Automatic).await
+    }
+
+    async fn check_update(&self) -> KnownUpdate {
+        checked_result(self.check(CheckMode::Manual).await)
     }
 
     async fn install(&self) -> Result<(), String> {
+        if self.disabled() {
+            return Err("self-update disabled (OMP_DECK_NO_AUTOUPDATE)".to_string());
+        }
         run_self_update(true, false).await
     }
 }
@@ -322,6 +416,154 @@ pub fn spawn_successor(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    fn release() -> LatestRelease {
+        LatestRelease {
+            tag_name: "v99.0.0".into(),
+            html_url: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_negative_expires_and_manual_bypasses_automatic_negative() {
+        let t = Instant::now();
+        let mut cache = WebCache::default();
+        cache
+            .check(CheckMode::Automatic, || t, || async { Ok(None) })
+            .await;
+        let cached = cache
+            .check(
+                CheckMode::Automatic,
+                || t,
+                || async { panic!("a page load must use the cache") },
+            )
+            .await;
+        assert!(cached.latest.is_none());
+        let fresh = cache
+            .check(
+                CheckMode::Automatic,
+                || t + KNOWN_UPDATE_TTL,
+                || async { Ok(Some(release())) },
+            )
+            .await;
+        assert!(fresh.latest.is_some());
+
+        let mut cache = WebCache::default();
+        cache
+            .check(CheckMode::Automatic, || t, || async { Ok(None) })
+            .await;
+        let manual = cache
+            .check(CheckMode::Manual, || t, || async { Ok(Some(release())) })
+            .await;
+        assert!(manual.latest.is_some());
+        cache
+            .check(
+                CheckMode::Manual,
+                || t,
+                || async { panic!("manual cooldown") },
+            )
+            .await;
+        let refreshed = cache
+            .check(CheckMode::Manual, || t + RETRY_TTL, || async { Ok(None) })
+            .await;
+        assert!(refreshed.latest.is_none());
+    }
+
+    #[tokio::test]
+    async fn web_failures_retry_and_preserve_known_release() {
+        let t = Instant::now();
+        let mut cache = WebCache::default();
+        let failed = cache
+            .check(
+                CheckMode::Automatic,
+                || t,
+                || async { Err("offline".into()) },
+            )
+            .await;
+        assert_eq!(failed.error.as_deref(), Some("offline"));
+        cache
+            .check(
+                CheckMode::Automatic,
+                || t,
+                || async { panic!("error cooldown") },
+            )
+            .await;
+        let recovered = cache
+            .check(
+                CheckMode::Automatic,
+                || t + RETRY_TTL,
+                || async { Ok(Some(release())) },
+            )
+            .await;
+        assert!(recovered.error.is_none());
+        let failed = cache
+            .check(
+                CheckMode::Manual,
+                || t + RETRY_TTL,
+                || async { Err("offline".into()) },
+            )
+            .await;
+        assert!(failed.latest.is_some());
+        assert!(
+            checked_result(failed).is_err(),
+            "an install must not proceed from stale data"
+        );
+        let refreshed = cache
+            .check(CheckMode::Install, || t + RETRY_TTL, || async { Ok(None) })
+            .await;
+        assert!(refreshed.latest.is_none());
+        assert!(refreshed.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn web_cache_ignores_persisted_notification_negative() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        kaishin::save_check_state(
+            &path,
+            &kaishin::UpdateCheckState {
+                last_checked_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                last_known_latest: Some(env!("CARGO_PKG_VERSION").into()),
+                last_known_url: None,
+            },
+        )
+        .unwrap();
+        let checker = Checker::new("omp-deck", options()).state_path(&path);
+        assert!(!checker.should_check());
+        assert!(checker.cached_update().is_none());
+        // The web cache starts empty, regardless of the persisted CLI state.
+        let status = WebCache::default()
+            .check(CheckMode::Automatic, Instant::now, || async {
+                Ok(Some(release()))
+            })
+            .await;
+        assert!(status.latest.is_some());
+        assert!(!checker.should_check());
+    }
+
+    #[tokio::test]
+    async fn concurrent_web_checks_coalesce() {
+        for mode in [CheckMode::Automatic, CheckMode::Manual] {
+            let cache = Mutex::new(WebCache::default());
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let check = || async {
+                cache
+                    .lock()
+                    .await
+                    .check(mode, Instant::now, || async {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        Ok(None)
+                    })
+                    .await
+            };
+            tokio::join!(check(), check(), check());
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
 
     #[test]
     fn disabled_by_table() {

@@ -68,13 +68,36 @@ omp-deck self-update [--yes] [--check]                       # update the binary
   to once every 24 hours) and prints a banner to stderr pointing at
   `omp-deck self-update` if one exists — never a silent install. Set
   `OMP_DECK_NO_AUTOUPDATE=1` to disable the check entirely.
-- The dashboard's **Update & restart** button (`POST /api/self-update`) does
-  the same install `omp-deck self-update -y` does, but from the phone: it
-  checks for a newer release, and if there is one, installs it and restarts
-  the process in place, listening again on the same address. Answers `200`
-  if already up to date (no restart), `202` once an install has started (the
-  dashboard is briefly unreachable during the handover), `403` if
-  `OMP_DECK_NO_AUTOUPDATE` is set, and `409` if one is already in progress.
+- The dashboard always offers **Check for updates**. `GET /api/update` uses a
+  process-local cache (5 minutes after success, 30 seconds after failure),
+  independent of the CLI notification's persisted 24-hour cache. The page
+  refreshes this status every minute while visible, and on focus or return
+  to the tab. A release published after a negative result is normally found
+  within about 6 minutes while the page is visible. Hidden tabs can delay it.
+- **Check for updates** (`POST /api/update/check`, with
+  `X-Omp-Deck-Action: check-update`) bypasses the automatic cache and never
+  installs or restarts. Manual checks share a separate 30-second cooldown;
+  a recent automatic result does not suppress the first manual check.
+  The endpoint returns `403` when disabled or missing the header and `502`
+  on a failed fetch. Status responses preserve `available` and `to` and add
+  `disabled` and `error`; failures stay visible and preserve any known update.
+  `OMP_DECK_NO_AUTOUPDATE=1` blocks all web checks and installation without
+  contacting GitHub. Responses use `Cache-Control: no-store`.
+- Once a release is found, **Update & restart** (`POST /api/self-update`)
+  checks afresh before starting the same install as `omp-deck self-update -y`.
+  It installs and restarts on the same address only when an update exists.
+  It answers `200` if already up to date (no restart), `202` once installation
+  starts, `403` when disabled, `409` while an install is in progress, and
+  `502` if the pre-install check fails. `202` is acceptance, not completion:
+  installation failures are logged and do not restart the server. The page
+  reloads after 8 seconds; a slow install may require a later manual reload.
+- Web cache entries are fetched again after process restart. Concurrent
+  discovery requests in one process share the cache; separate processes do
+  not. GitHub outages and rate limits still prevent discovery and installation;
+  failed automatic checks retry after 30 seconds when status is requested.
+  Explicit checks can retry sooner than that after an automatic failure,
+  subject to their own cooldown. The install path revalidates the release
+  again through the installer and never restarts on a failed install.
 
 ## Starting a session from the dashboard
 

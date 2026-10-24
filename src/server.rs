@@ -6,12 +6,12 @@ use crate::omp::{Access, Omp, OmpError, resume_target};
 use crate::remote;
 use crate::repos;
 use crate::sessions;
-use crate::update::{RealUpdater, SelfUpdater};
+use crate::update::{RealUpdater, SelfUpdater, UpdateStatus};
 use crate::view;
 use axum::{
     Json, Router,
     extract::{FromRef, Path, State},
-    http::{HeaderName, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
@@ -87,6 +87,7 @@ pub fn router_with_updater(
             post(api_repo_sessions_resume),
         )
         .route("/api/update", get(api_update))
+        .route("/api/update/check", post(api_update_check))
         .route("/api/self-update", post(api_self_update))
         .route("/go/{instance_id}/{kind}", get(go))
         .layer(middleware::map_response(harden))
@@ -331,6 +332,45 @@ async fn api_repo_sessions_resume(
     }
 }
 
+fn update_json(status: UpdateStatus, disabled: bool) -> Response {
+    Json(json!({
+        "available": status.latest.is_some(),
+        "to": status.latest.map(|release| release.tag_name),
+        "disabled": disabled,
+        "error": status.error,
+    }))
+    .into_response()
+}
+
+async fn api_update(State(state): State<AppState>) -> Response {
+    if state.updater.disabled() {
+        return update_json(UpdateStatus::default(), true);
+    }
+    update_json(state.updater.known_update().await, false)
+}
+
+async fn api_update_check(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    // Browsers cannot send this header cross-origin without a CORS preflight;
+    // this router grants no CORS permissions. Form POSTs cannot trigger a check.
+    if headers
+        .get("x-omp-deck-action")
+        .and_then(|h| h.to_str().ok())
+        != Some("check-update")
+    {
+        return plain(StatusCode::FORBIDDEN, "missing update check header");
+    }
+    if state.updater.disabled() {
+        return plain(
+            StatusCode::FORBIDDEN,
+            "self-update disabled (OMP_DECK_NO_AUTOUPDATE)",
+        );
+    }
+    match state.updater.check_update().await {
+        Ok(latest) => update_json(Ok(latest).into(), false),
+        Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": error }))).into_response(),
+    }
+}
+
 /// Checks for a newer release and, if there is one, installs it and hands
 /// the dashboard over to a fresh successor process.
 ///
@@ -343,22 +383,6 @@ async fn api_repo_sessions_resume(
 /// actually dropped, and only then does `main.rs` spawn the successor and
 /// let this process exit. Spawning the successor any earlier would race it
 /// against this process for the port.
-async fn api_update(State(state): State<AppState>) -> Response {
-    if state.updater.disabled() {
-        return Json(json!({ "available": false })).into_response();
-    }
-    match state.updater.known_update().await {
-        Ok(Some(latest)) => Json(json!({ "available": true, "to": latest.tag_name })),
-        Ok(None) => Json(json!({ "available": false })),
-        // Unknown is not available: a failed check hides the button.
-        Err(e) => {
-            eprintln!("omp-deck: update check failed: {e}");
-            Json(json!({ "available": false }))
-        }
-    }
-    .into_response()
-}
-
 async fn api_self_update(State(state): State<AppState>) -> Response {
     if state.updater.disabled() {
         return plain(
@@ -597,9 +621,12 @@ mod tests {
             *self.newer_calls.lock() += 1;
             self.newer.clone()
         }
-        async fn known_update(&self) -> Result<Option<LatestRelease>, String> {
+        async fn known_update(&self) -> UpdateStatus {
             *self.known_calls.lock() += 1;
-            self.known.clone()
+            self.known.clone().into()
+        }
+        async fn check_update(&self) -> Result<Option<LatestRelease>, String> {
+            self.newer_release().await
         }
         async fn install(&self) -> Result<(), String> {
             *self.installs.lock() += 1;
@@ -1441,6 +1468,75 @@ mod tests {
         assert!(omp.resumes.lock().is_empty());
     }
 
+    #[tokio::test]
+    async fn manual_check_requires_header_respects_disable_and_never_installs() {
+        for disabled in [false, true] {
+            for with_header in [false, true] {
+                let updater = FakeUpdater::new(disabled, Ok(Some(release("v9.9.9"))));
+                let (tx, rx) = watch::channel(false);
+                let app =
+                    router_with_updater(fixture(), launcher(Vec::new(), &[]), updater.clone(), tx);
+                let mut request = Request::post("/api/update/check");
+                if with_header {
+                    request = request.header("x-omp-deck-action", "check-update");
+                }
+                let response = app
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let allowed = with_header && !disabled;
+                assert_eq!(
+                    response.status(),
+                    if allowed {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::FORBIDDEN
+                    }
+                );
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                if allowed {
+                    assert!(
+                        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["available"]
+                            .as_bool()
+                            .unwrap()
+                    );
+                }
+                assert_eq!(*updater.newer_calls.lock(), u32::from(allowed));
+                assert_eq!(*updater.installs.lock(), 0);
+                assert!(!*rx.borrow());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_check_failure_is_visible_without_install_or_restart() {
+        let updater = FakeUpdater::new(false, Err("offline".into()));
+        let (tx, rx) = watch::channel(false);
+        let app = router_with_updater(fixture(), launcher(Vec::new(), &[]), updater.clone(), tx);
+        let response = app
+            .oneshot(
+                Request::post("/api/update/check")
+                    .header("x-omp-deck-action", "check-update")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+            "offline"
+        );
+        assert_eq!(*updater.installs.lock(), 0);
+        assert!(!*rx.borrow());
+    }
+
     async fn post_self_update(app: Router) -> (StatusCode, String) {
         let res = app
             .oneshot(
@@ -1511,6 +1607,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_install_does_not_restart_and_allows_retry() {
+        let mut updater = FakeUpdater::new(false, Ok(Some(release("v9.9.9"))));
+        Arc::get_mut(&mut updater).unwrap().install_result = Err("install failed".into());
+        let (tx, rx) = watch::channel(false);
+        let app = router_with_updater(fixture(), launcher(Vec::new(), &[]), updater.clone(), tx);
+        for _ in 0..2 {
+            let (status, _) = post_self_update(app.clone()).await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            tokio::task::yield_now().await;
+            assert!(!*rx.borrow());
+        }
+        assert_eq!(*updater.installs.lock(), 2);
+    }
+
+    #[tokio::test]
     async fn self_update_second_request_is_rejected_while_the_first_is_in_progress() {
         let omp = fixture();
         let updater = FakeUpdater::new(false, Ok(Some(release("v9.9.9"))));
@@ -1547,7 +1658,10 @@ mod tests {
         let updater = FakeUpdater::new(false, Ok(Some(release("v9.9.9"))));
         let (status, v, rx) = update_json(&updater).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(v, json!({ "available": true, "to": "v9.9.9" }));
+        assert_eq!(
+            v,
+            json!({ "available": true, "to": "v9.9.9", "disabled": false, "error": null })
+        );
         // A GET never installs or restarts.
         assert_eq!(*updater.installs.lock(), 0);
         assert!(!*rx.borrow());
@@ -1558,7 +1672,10 @@ mod tests {
         let updater = FakeUpdater::new(false, Ok(None));
         let (status, v, _rx) = update_json(&updater).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(v, json!({ "available": false }));
+        assert_eq!(
+            v,
+            json!({ "available": false, "to": null, "disabled": false, "error": null })
+        );
         assert_eq!(*updater.known_calls.lock(), 1);
     }
 
@@ -1567,7 +1684,10 @@ mod tests {
         let updater = FakeUpdater::new(true, Ok(Some(release("v9.9.9"))));
         let (status, v, _rx) = update_json(&updater).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(v, json!({ "available": false }));
+        assert_eq!(
+            v,
+            json!({ "available": false, "to": null, "disabled": true, "error": null })
+        );
         assert_eq!(*updater.known_calls.lock(), 0);
         assert_eq!(*updater.newer_calls.lock(), 0);
     }
@@ -1577,7 +1697,10 @@ mod tests {
         let updater = FakeUpdater::new(false, Err("github is down".to_string()));
         let (status, v, _rx) = update_json(&updater).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(v, json!({ "available": false }));
+        assert_eq!(
+            v,
+            json!({ "available": false, "to": null, "disabled": false, "error": "github is down" })
+        );
         assert_eq!(*updater.installs.lock(), 0);
     }
 }
