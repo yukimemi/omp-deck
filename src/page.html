@@ -44,18 +44,19 @@ details#new-session summary { cursor: pointer; font-weight: 600; }
 #ns-status { margin: 0; font-size: .85rem; color: var(--muted); overflow-wrap: anywhere; }
 #ns-status.err { color: #c92a2a; }
 code { font-family: ui-monospace, monospace; }
-#self-update { display: flex; align-items: center; gap: .6rem; margin: 0 0 1rem; }
+#self-update { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin: 0 0 1rem; }
 #self-update[hidden] { display: none; }
-#su-btn { font: inherit; padding: .4rem .8rem; border-radius: .4rem; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
-#su-btn:disabled { opacity: .5; cursor: default; }
+#su-btn, #su-check { font: inherit; padding: .4rem .8rem; border-radius: .4rem; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+#su-btn:disabled, #su-check:disabled { opacity: .5; cursor: default; }
 #su-status { margin: 0; font-size: .85rem; color: var(--muted); overflow-wrap: anywhere; }
 #su-status.err { color: #c92a2a; }
 </style>
 </head>
 <body>
 <h1>omp deck</h1>
-<div id="self-update" hidden>
-<button id="su-btn" type="button">Update &amp; restart</button>
+<div id="self-update">
+<button id="su-check" type="button">Check for updates</button>
+<button id="su-btn" type="button" hidden>Update &amp; restart</button>
 <p id="su-status" role="status"></p>
 </div>
 <details id="new-session">
@@ -74,16 +75,45 @@ code { font-family: ui-monospace, monospace; }
   var suBtn = document.getElementById("su-btn");
   var suStatus = document.getElementById("su-status");
   function suSay(text, err) { suStatus.textContent = text; suStatus.className = err ? "err" : ""; }
-  var suBox = document.getElementById("self-update");
-  // Hidden until the server reports a newer release; any failure leaves it hidden.
-  fetch("/api/update").then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
-    if (d && d.available === true && typeof d.to === "string" && d.to) {
-      suBtn.textContent = "Update to " + d.to;
-      suBox.hidden = false;
-    }
-  }).catch(function () {});
+  var suCheck = document.getElementById("su-check");
+  var suBusy = false;
+  function showUpdate(d) {
+    suCheck.disabled = !!d.disabled;
+    suBtn.hidden = !d.available || !!d.disabled;
+    if (d.available) suBtn.textContent = "Update to " + d.to + " & restart";
+    suSay(d.disabled ? "updates disabled" : d.error ? "check failed: " + d.error :
+      d.available ? "new release available" : "already up to date", !!d.error);
+  }
+  function checkUpdate(manual) {
+    if (suBusy || suCheck.disabled || (!manual && document.hidden)) return;
+    suBusy = true;
+    suCheck.disabled = true;
+    if (manual) suSay("checking...", false);
+    fetch(manual ? "/api/update/check" : "/api/update", manual ? {
+      method: "POST", headers: { "X-Omp-Deck-Action": "check-update" }
+    } : {}).then(function (r) {
+      return r.json().then(function (d) {
+        if (!r.ok) throw new Error(d.error || "check failed (" + r.status + ")");
+        return d;
+      });
+    }).then(function (d) {
+      suCheck.disabled = false;
+      showUpdate(d);
+    }).catch(function (e) {
+      suCheck.disabled = false;
+      suSay("check failed: " + e, true);
+    }).then(function () { suBusy = false; });
+  }
+  suCheck.addEventListener("click", function () { checkUpdate(true); });
+  checkUpdate(false);
+  setInterval(function () { checkUpdate(false); }, 60000);
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) checkUpdate(false); });
+  window.addEventListener("focus", function () { checkUpdate(false); });
   suBtn.addEventListener("click", function () {
     if (!window.confirm("Check for a newer omp-deck release and restart onto it if found? The dashboard is briefly unreachable during the restart.")) return;
+    if (suBusy) return;
+    suBusy = true;
+    suCheck.disabled = true;
     suBtn.disabled = true;
     suSay("checking...", false);
     fetch("/api/self-update", { method: "POST" }).then(function (r) {
@@ -95,9 +125,12 @@ code { font-family: ui-monospace, monospace; }
           setTimeout(function () { location.reload(); }, 8000);
         });
       }
-      if (r.status === 200) { suSay("already up to date", false); suBtn.disabled = false; suBox.hidden = true; return; }
+      if (r.status === 200) { suSay("already up to date", false); suBtn.disabled = false; suBtn.hidden = true; return; }
       return r.text().then(function (t) { suSay("failed (" + r.status + "): " + t, true); suBtn.disabled = false; });
-    }).catch(function (e) { suSay("failed: " + e, true); suBtn.disabled = false; });
+    }).catch(function (e) { suSay("failed: " + e, true); suBtn.disabled = false; }).then(function () {
+      // Keep polling paused after acceptance while the installation runs.
+      if (!suBtn.disabled) { suBusy = false; suCheck.disabled = false; }
+    });
   });
   var box = document.getElementById("new-session");
   var repo = document.getElementById("ns-repo");
