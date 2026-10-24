@@ -277,6 +277,18 @@ async fn api_repo_sessions(State(l): State<Arc<Launcher>>, Path(path): Path<Stri
         return Json(json!({ "sessions": [] })).into_response();
     };
     let entries = sessions::list(root, l.home.as_deref(), std::path::Path::new(&repo.path));
+    let entries: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            let title = view::browser_title(&entry.title);
+            json!({
+                "sessionId": entry.session_id,
+                "title": entry.title,
+                "updatedAtMs": entry.updated_at_ms,
+                "displayTitle": if title.is_empty() { &entry.session_id } else { title },
+            })
+        })
+        .collect();
     Json(json!({ "sessions": entries })).into_response()
 }
 
@@ -1275,6 +1287,55 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["stale", "newer", "older"]);
         assert_eq!(v["sessions"][1]["title"], "Newer session");
+    }
+
+    #[tokio::test]
+    async fn repo_sessions_preserve_raw_titles_and_add_browser_display_titles() {
+        let (_t, l, path, _lock) = sessions_layout();
+        let dir = l.sessions_root.as_ref().unwrap().join("-h-o-r");
+        let cases = [
+            ("\u{f0093} RSRCH: Research", "RSRCH: Research"),
+            ("\u{f0199} ATTMPT: Attempt", "ATTMPT: Attempt"),
+            ("\u{f0668} FLAKY: Flaky", "FLAKY: Flaky"),
+            ("\u{f04c1} SPLIT: Split", "SPLIT: Split"),
+            ("  plain 日本語 🧪  ", "  plain 日本語 🧪  "),
+            ("\u{e6ae} <b>&\"' body \u{f407}", "<b>&\"' body \u{f407}"),
+            ("\u{f0093} \u{f0199} ", "case-6"),
+            ("", "case-7"),
+        ];
+        for (i, (raw, _)) in cases.iter().enumerate() {
+            write_session_fixture(
+                &dir,
+                &format!("2026-01-05T00-00-00-000Z_case-{i}.jsonl"),
+                raw,
+                &format!("case-{i}"),
+                std::path::Path::new(&path),
+                1,
+            );
+        }
+        let (status, body) = call(
+            router(fixture(), l),
+            Request::get(format!("/api/repos/{}/sessions", encode_path(&path)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let entries = v["sessions"].as_array().unwrap();
+        for (i, (raw, display)) in cases.iter().enumerate() {
+            let entry = entries
+                .iter()
+                .find(|e| e["sessionId"] == format!("case-{i}"))
+                .unwrap();
+            assert_eq!(entry["title"], *raw);
+            assert_eq!(entry["displayTitle"], *display);
+            assert!(entry["updatedAtMs"].is_i64());
+        }
+        assert_eq!(
+            entries.iter().find(|e| e["sessionId"] == "newer").unwrap()["displayTitle"],
+            "Newer session"
+        );
     }
 
     #[tokio::test]

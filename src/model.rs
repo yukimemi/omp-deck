@@ -78,14 +78,17 @@ impl Host {
     pub fn display_name(&self) -> &str {
         match self.session_name.as_deref().map(str::trim) {
             Some(name) if !name.is_empty() => name,
-            _ => {
-                let dir = last_component(&self.cwd);
-                if dir.is_empty() {
-                    &self.instance_id
-                } else {
-                    dir
-                }
-            }
+            _ => self.unnamed_display_name(),
+        }
+    }
+
+    /// The existing cwd/instance fallback, also used when a web title is decoration only.
+    pub(crate) fn unnamed_display_name(&self) -> &str {
+        let dir = last_component(&self.cwd);
+        if dir.is_empty() {
+            &self.instance_id
+        } else {
+            dir
         }
     }
 
