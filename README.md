@@ -102,8 +102,9 @@ omp-deck self-update [--yes] [--check]                       # update the binary
 ## Starting a session from the dashboard
 
 The **New session** panel lists local checkouts and starts
-`omp --cwd <checkout> [--model <model>]` for the one you pick. There is no
-initial prompt and no other option: send prompts from the collab room. The
+`omp --cwd <checkout> [--model <model>]` for the one you pick. Filter the
+repository list by name or local path (case-insensitive substring matching).
+There is no initial prompt and no other option: send prompts from the collab room. The
 session shows up as a normal card once omp publishes it, so omp must be
 configured with `collab.autoStart control` (see above).
 
