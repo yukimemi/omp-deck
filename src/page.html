@@ -62,7 +62,7 @@ code { font-family: ui-monospace, monospace; }
 <details id="new-session">
 <summary>New session</summary>
 <form id="ns-form">
-<label>Repository <input type="search" id="ns-filter" placeholder="Filter by owner/name" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search" aria-label="Filter repositories"><select id="ns-repo" required></select></label>
+<label>Repository <input type="search" id="ns-filter" placeholder="Filter by name or path" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search" aria-label="Filter repositories by name or path"><select id="ns-repo" required></select></label>
 <label id="ns-resume-label" hidden>Resume a past session <select id="ns-resume"><option value="">(start new session)</option></select></label>
 <label id="ns-model-label" hidden>Model <select id="ns-model"><option value="">(omp default)</option></select></label>
 <button type="submit" id="ns-go" disabled>Start omp</button>
@@ -149,12 +149,11 @@ code { font-family: ui-monospace, monospace; }
   // Remote-only entries have no path; they are told apart by a "remote:" prefix.
   function valueOf(r) { return r.remote ? "remote:" + r.name : r.path; }
   function isRemote() { return repo.value.indexOf("remote:") === 0; }
-  // Case-insensitive substring match on the full name (owner/name) and the short name.
+  // Case-insensitive substring match on the name (owner/name) and local path.
   function matches(r, q) {
     q = q.trim().toLowerCase();
     if (!q) return true;
-    var full = r.name.toLowerCase();
-    return full.indexOf(q) !== -1 || full.split("/").pop().indexOf(q) !== -1;
+    return r.name.toLowerCase().indexOf(q) !== -1 || (r.path || "").toLowerCase().indexOf(q) !== -1;
   }
   // Rebuild the options rather than hiding them (hidden <option> is ignored on iOS Safari).
   // The selection survives if still matching, else it moves to the first match.
