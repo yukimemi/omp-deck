@@ -1,9 +1,9 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-11-14T03:21:33.097655392Z"
+applied_at = "2026-11-22T03:23:04.20042001Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "e6da08d35873812eae82841e5c7cf82c8d4d0185"
+rev = "fde196ac259b1acde901d0cbc91516ae2fbd7bfb"
 version = "0.18.0"
 
 [[templates]]
@@ -41,7 +41,7 @@ content_hash = "4e2735f40c2ae61014810159a2458da2edc1646589f5f65d9f2f3d099366c9a8
 content_hash = "8a53e46d208f472b95504f9d3c8951b7b7daccbbb222469a87a7df93059b4289"
 
 [files.".github/workflows/kata-apply.yml"]
-content_hash = "72267ad7aefb2545ec0e514ccaf8748ed2b3fc3e9c36f73616e6e1c2a34176c1"
+content_hash = "c47add76ce8c17a0fff04bc18d2bbd8fe8c3cd03cd93fbe24a16ec4ba162aff4"
 
 [files.".github/workflows/release.yml"]
 content_hash = "7f8a50a0cafc20fa6835908881666b0f0bb9b4148ee5f697b87e33b848c9d29f"
